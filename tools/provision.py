@@ -507,8 +507,14 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     all_errors.extend(errs)
 
     # ── Phase 13: Spot awards ──────────────────────────────────────────────────
-    # Use uid6 to avoid code collisions across multiple orgs with the same company code
+    # Use uid6 to derive unique award code prefix — avoids collisions across orgs
     BASE_CODE = 800000 + (int(uid6, 16) % 99000)
+
+    # Award date: 30 days ago (recent-past recognition)
+    import datetime as _dt_award
+    _award_dt = _today - _dt_award.timedelta(days=30)
+    import calendar as _cal_award
+    AWARD_DATE = f"/Date({int(_cal_award.timegm(_award_dt.timetuple())) * 1000})/"
 
     # Discover the active SpotAwardProgram at runtime — use first active one found
     _active_program = None
@@ -532,22 +538,20 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     award_rows = []
     ceo_id = employees[0]["userId"]
     for i, sub in enumerate(employees[1:]):
-        # Use plan-level spot_award message if present, else fall back to generic template
         comment = sub.get("spot_award") or _default_award_msgs[min(i, 3)]
-        pts = [300, 200, 200, 100][min(i, 3)]
-        code = BASE_CODE + i + 1
+        amt = [2500.0, 1500.0, 1500.0, 1000.0][min(i, 3)]
+        code = f"AWD-{BASE_CODE + i + 1}"
         row = {
-            "__metadata": {"uri": f"SpotAward({code})"},
+            "__metadata": {"uri": f"SpotAward('{code}')"},
             "externalCode": code,
             "userId":       sub["userId"],
             "nominatorId":  ceo_id,
-            "awardAmount":  float(pts),
-            "currency":     "POINTS",
-            "category":     "1",
-            "level":        "1",
-            "approvalStatus": "APPROVED",
-            "commentForReceiver": comment,
-            "commentForApprovers": "Above guideline: impact warranted top recognition.",
+            "awardAmount":  amt,
+            "currency":     "USD",
+            "awardDate":    AWARD_DATE,
+            "awardReason":  comment,
+            "category":     "Recognition",
+            "status":       "Approved",
         }
         if _active_program:
             row["spotAwardProgram"] = _active_program
@@ -556,8 +560,8 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     results["SpotAwards"] = f"{ok}/{len(award_rows)}"
     if errs:
         print(f"[spot_awards] errors codes={[r['externalCode'] for r in award_rows]} errs={errs[:3]}", flush=True)
-    # Don't surface spot award eligibility errors — graceful
-    non_eligibility_errs = [e for e in errs if "not eligible" not in e.lower()]
+    # Don't surface eligibility/program config errors as blocking failures
+    non_eligibility_errs = [e for e in errs if not any(w in e.lower() for w in ("not eligible", "inactive", "expired"))]
     all_errors.extend(non_eligibility_errs)
 
     # ── Phase 14: Onboardee ────────────────────────────────────────────────────
