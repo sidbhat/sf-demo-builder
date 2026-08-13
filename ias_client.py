@@ -88,7 +88,7 @@ def _ias_ensure_user(username: str, password: str, email: str,
         body = e.read().decode(errors="replace")
         # IAS password history policy — retry with a fresh random password
         if e.code == 400 and "password" in body.lower() and "history" in body.lower():
-            user_data["password"] = "Demo" + secrets.token_hex(3).upper() + "26!"
+            user_data["password"] = "Demo" + secrets.token_hex(1).upper() + "26!"
             payload2 = json.dumps(user_data).encode()
             req2 = urllib.request.Request(
                 f"{ias_scim}/{scim_id}", data=payload2, method="PUT",

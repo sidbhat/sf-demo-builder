@@ -121,8 +121,8 @@ def design_demo_org(
 
     # Generate unique password per org — avoids IAS password history rejection on re-runs
     if not password:
-        suffix = secrets.token_hex(2).upper()  # e.g. "A3F2"
-        password = f"Demo{suffix}26!"          # e.g. "DemoA3F226!"
+        suffix = secrets.token_hex(1).upper()  # e.g. "A3" (2 hex chars)
+        password = f"Demo{suffix}26!"          # e.g. "DemoA326!" — 9 chars, fits ≤10-char policy
 
     # Auto-assign company code if not given (hash company name to 4-digit range 5000-9000)
     if not company_code:
