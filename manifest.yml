@@ -7,8 +7,8 @@ applications:
       - python_buildpack
     stack: cflinuxfs4
     command: python server.py
-    health-check-type: http
-    health-check-http-endpoint: /health
+    health-check-type: process
+    timeout: 180
     env:
       SF_ADMIN_USER: sfadmin@SFSALES011375
       EMAIL_PREFIX: siddhartha.bhattacharya
@@ -16,4 +16,4 @@ applications:
       # SF_ADMIN_PASS, IAS_CLIENT_ID, IAS_CLIENT_SECRET set via cf set-env
     services:
       - sf-demo-builder-uaa
-      - hana
+      - sf-demo-builder-db

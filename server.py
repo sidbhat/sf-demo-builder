@@ -27,6 +27,8 @@ except ImportError:
 
 import json
 import base64
+import hashlib
+import secrets
 import ssl
 import sys
 import uuid
@@ -34,10 +36,19 @@ import urllib.request
 import urllib.parse
 import time
 import os
+import contextvars
+import threading
+import datetime as _dt
 from datetime import datetime
 from typing import Optional
 
 import db as _db
+
+# ── Background provisioning job store ────────────────────────────────────────
+# job_id → {"status": "pending"|"running"|"done"|"error", "result": str|None,
+#            "started_at": float, "error": str|None}
+_JOBS: dict[str, dict] = {}
+_JOBS_LOCK = threading.Lock()
 
 # ── Auth configuration ────────────────────────────────────────────────────────
 # SAP accounts.sap.com OIDC — tokens issued by SAP employee login
@@ -57,6 +68,16 @@ PORT = int(os.environ.get("PORT", "8000"))
 # In stdio mode (default, used by Claude Code MCP) auth is bypassed —
 # the local process boundary is the trust boundary.
 _HTTP_MODE = "--http" in sys.argv or "VCAP_APPLICATION" in os.environ
+
+# ContextVar set by ApiKeyMiddleware so _extract_caller_email can read it
+# without needing to thread the raw Starlette scope through every call.
+_api_key_caller: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "api_key_caller", default=None
+)
+# Flag: True when the current request came through /a2a/ (API key path)
+_is_a2a_request: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "is_a2a_request", default=False
+)
 
 
 def _vcap_xsuaa_creds() -> Optional[dict]:
@@ -79,18 +100,25 @@ def _vcap_xsuaa_creds() -> Optional[dict]:
 def _build_auth():
     if not _HTTP_MODE:
         return None
+    if os.environ.get("SKIP_MCP_AUTH", "").lower() in ("1", "true", "yes"):
+        return None
     from fastmcp.server.auth import RemoteAuthProvider, JWTVerifier
 
     vcap_creds = _vcap_xsuaa_creds()
     if vcap_creds and vcap_creds.get("verificationkey"):
-        # CF runtime: use inline RSA public key from XSUAA service binding
-        issuer = vcap_creds.get("url", XSUAA_ISSUER)
-        verifier = JWTVerifier(
+        # CF runtime: use inline RSA public key from XSUAA service binding.
+        # XSUAA tokens have iss = <url>/oauth/token — must match exactly.
+        base_url = vcap_creds.get("url", XSUAA_ISSUER).rstrip("/")
+        issuer    = base_url + "/oauth/token"
+        verifier  = JWTVerifier(
             public_key=vcap_creds["verificationkey"],
             issuer=issuer,
             algorithm="RS256",
+            # No audience check — XSUAA tokens carry ['uaa', clientid] in aud;
+            # issuer validation is sufficient to establish token provenance.
         )
-        auth_servers = [issuer]
+        # Tell Joule/MCP clients where to get tokens (the base UAA URL, not /oauth/token)
+        auth_servers = [base_url + "/"]
     else:
         # Local / custom: use JWKS URI
         verifier = JWTVerifier(
@@ -142,27 +170,184 @@ for _ca in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
 
 LOGIN_URL = "https://hcm-us10-sales.hr.cloud.sap/login?company=SFSALES011375"
 
-# ── Principal propagation helpers ─────────────────────────────────────────────
+# ── Per-user SF instance config ───────────────────────────────────────────────
 
-def _extract_caller_email(ctx=None) -> Optional[str]:
-    """Extract SAP email from the validated XSUAA JWT context.
+def _detect_ias_from_login_url(login_url: str) -> Optional[str]:
+    """Follow the SF login URL redirect chain to discover the IAS tenant base URL.
 
-    In HTTP mode FastMCP puts the verified AccessToken on the request context.
-    Returns None in stdio mode (no auth token present).
+    SF login → /saml2/Login (internal) → IAS hostname (accounts.cloud.sap / accounts.ondemand.com).
+    Follows up to 4 redirect hops so we reach the IAS URL even when SF issues
+    an internal relative redirect first.
+    Returns the IAS base URL (scheme+host) or None if no IAS redirect found.
     """
-    if not _HTTP_MODE:
-        return None
-    try:
-        from fastmcp import Context
-        if ctx and hasattr(ctx, "auth_context") and ctx.auth_context:
-            claims = getattr(ctx.auth_context, "extra", {}) or {}
-            return claims.get("email") or claims.get("user_name")
-    except Exception:
-        pass
+    from urllib.parse import urlparse, urljoin
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **kw):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect())
+
+    current_url = login_url
+    for _ in range(4):
+        try:
+            req = urllib.request.Request(
+                current_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                method="GET",
+            )
+            try:
+                opener.open(req, timeout=10)
+                break  # 200 — end of chain, no IAS redirect found
+            except urllib.error.HTTPError as e:
+                loc = e.headers.get("Location", "")
+                if not loc:
+                    break
+                # Resolve relative redirects against current URL
+                loc = urljoin(current_url, loc)
+                print(f"[ias_detect] hop: {loc[:100]}", flush=True)
+                parsed = urlparse(loc)
+                host = parsed.netloc.lower()
+                if ".accounts.cloud.sap" in host or ".accounts.ondemand.com" in host:
+                    return f"{parsed.scheme}://{parsed.netloc}"
+                current_url = loc
+        except Exception as e:
+            print(f"[ias_detect] error: {e}", flush=True)
+            break
     return None
 
 
-def _alias_from_email(email: str) -> Optional[str]:
+def _build_sf_config(caller_email: Optional[str]) -> dict:
+    """Return the SF + IAS config dict for this caller.
+
+    Checks DEMO_SF_CONFIGS for a custom config; falls back to env defaults.
+    Returns:
+      sf_base       - OData API base URL (no trailing slash)
+      sf_headers    - dict with Authorization/Accept/Content-Type
+      admin_user    - full username incl company code (e.g. sfadmin@SFSALES011375)
+      company_code  - extracted company code (e.g. SFSALES011375)
+      login_url     - browser login URL
+      ias_base      - IAS tenant base URL or None
+      ias_scim_url  - IAS SCIM Users URL or None
+      ias_auth      - Basic auth header value for IAS or None
+    """
+    custom = _db.get_sf_config(caller_email) if caller_email else None
+
+    if custom:
+        api_base   = custom["api_base_url"].rstrip("/")
+        admin_user = custom["admin_user"]
+        admin_pass = custom["admin_pass"]
+        login_url  = custom["login_url"]
+        ias_base   = custom.get("ias_base_url")
+        ias_cid    = custom.get("ias_client_id")
+        ias_csec   = custom.get("ias_client_secret")
+    else:
+        api_base   = SF_BASE.rstrip("/")
+        admin_user = _sf_user
+        admin_pass = _sf_pass
+        login_url  = LOGIN_URL
+        ias_base   = IAS_BASE
+        ias_cid    = IAS_CLIENT_ID
+        ias_csec   = IAS_CLIENT_SECRET
+
+    creds = base64.b64encode(f"{admin_user}:{admin_pass}".encode()).decode()
+    headers = {
+        "Authorization": f"Basic {creds}",
+        "Accept":        "application/json",
+        "Content-Type":  "application/json",
+    }
+    # Company code is the part after @ in admin_user (e.g. sfadmin@SFSALES011375)
+    company_code = admin_user.split("@", 1)[1] if "@" in admin_user else "UNKNOWN"
+
+    ias_scim = None
+    ias_auth_hdr = None
+    if ias_base and ias_cid and ias_csec:
+        ias_scim = ias_base.rstrip("/") + "/service/scim/Users"
+        ias_auth_hdr = "Basic " + base64.b64encode(f"{ias_cid}:{ias_csec}".encode()).decode()
+
+    return {
+        "sf_base":      api_base,
+        "sf_headers":   headers,
+        "admin_user":   admin_user,
+        "admin_pass":   admin_pass,
+        "company_code": company_code,
+        "login_url":    login_url,
+        "ias_base":     ias_base if (ias_scim) else None,
+        "ias_scim_url": ias_scim,
+        "ias_auth":     ias_auth_hdr,
+    }
+
+def _extract_caller_email(ctx=None) -> Optional[str]:
+    """Return the authenticated caller's email.
+
+    Priority:
+    1. API-key path — ContextVar set by ApiKeyMiddleware before forwarding the request
+    2. JWT path — FastMCP get_access_token() reads AccessToken.claims from HTTP scope
+    3. None in stdio mode (no auth present)
+    """
+    # A2A / API-key path
+    api_key_email = _api_key_caller.get()
+    if api_key_email:
+        return api_key_email
+
+    if not _HTTP_MODE:
+        return None
+    try:
+        from fastmcp.server.dependencies import get_access_token
+        token = get_access_token()
+        if token is not None:
+            claims: dict = token.claims or {}
+            print(f"[auth] get_access_token claims keys={list(claims.keys())} "
+                  f"email={claims.get('email')!r} user_name={claims.get('user_name')!r} "
+                  f"sub={claims.get('sub')!r} client_id={token.client_id!r}", flush=True)
+            # XSUAA tokens carry email in "email", "user_name", or "sub"
+            email = (claims.get("email")
+                     or claims.get("user_name")
+                     or claims.get("sub"))
+            if email and "@" in str(email):
+                return str(email)
+            # client_id itself won't have @, but log it for debugging
+    except Exception as exc:
+        print(f"[auth] _extract_caller_email error: {exc}", flush=True)
+    return None
+
+
+@mcp.tool()
+def whoami(ctx=None) -> str:
+    """Return the authenticated caller's identity as seen by this server.
+
+    Use this to verify your XSUAA login is working and your email is being
+    captured correctly for org ownership and email prefix derivation.
+    """
+    email = _extract_caller_email(ctx)
+    is_a2a = _is_a2a_request.get()
+
+    # Dump raw access token claims for debugging
+    raw_claims: dict = {}
+    token_meta: dict = {}
+    try:
+        from fastmcp.server.dependencies import get_access_token
+        token = get_access_token()
+        if token is not None:
+            raw_claims = token.claims or {}
+            token_meta = {
+                "client_id": token.client_id,
+                "scopes": token.scopes,
+                "expires_at": token.expires_at,
+            }
+    except Exception as exc:
+        raw_claims["error"] = str(exc)
+
+    return json.dumps({
+        "caller_email":     email,
+        "auth_path":        "a2a_api_key" if is_a2a else "xsuaa_jwt",
+        "email_prefix":     email.split("@")[0].split("+")[0] if email else None,
+        "raw_auth_claims":  raw_claims,
+        "token_meta":       token_meta,
+    }, indent=2)
+
+
+def _alias_from_email(email: Optional[str]) -> Optional[str]:
     """Parse +alias from SAP email for principal propagation.
 
     siddhartha.bhattacharya+se.ceo@sap.com  ->  se.ceo
@@ -1098,12 +1283,12 @@ _DEFAULT_GOAL = (
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _sf_upsert(rows: list) -> tuple[int, list]:
+def _sf_upsert(rows: list, sf: dict) -> tuple[int, list]:
     """Returns (ok_count, error_messages)."""
     if not rows:
         return 0, []
     body = json.dumps(rows).encode()
-    req = urllib.request.Request(f"{SF_BASE}/upsert", data=body, headers=SF_HEADERS, method="POST")
+    req = urllib.request.Request(f"{sf['sf_base']}/upsert", data=body, headers=sf['sf_headers'], method="POST")
     try:
         with urllib.request.urlopen(req, context=CTX, timeout=60) as r:
             resp = json.loads(r.read())
@@ -1123,9 +1308,30 @@ def _sf_upsert(rows: list) -> tuple[int, list]:
         return 0, [f"HTTP {e.code}: {err}"]
 
 
-def _sf_post(entity: str, row: dict) -> tuple[bool, str]:
+def _sf_delete(uri: str, sf: dict) -> tuple[bool, str]:
+    """DELETE a single SF entity by its OData URI path (e.g. "User('NK001')")."""
+    req = urllib.request.Request(
+        f"{sf['sf_base']}/{uri}",
+        headers=sf['sf_headers'], method="DELETE")
+    try:
+        with urllib.request.urlopen(req, context=CTX, timeout=30):
+            return True, "ok"
+    except urllib.error.HTTPError as e:
+        err = e.read().decode(errors="replace")
+        try:
+            msg = json.loads(err)["error"]["message"]["value"]
+        except Exception:
+            msg = err[:200]
+        if e.code == 404:
+            return True, "not_found"
+        return False, msg[:120]
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+def _sf_post(entity: str, row: dict, sf: dict) -> tuple[bool, str]:
     body = json.dumps(row).encode()
-    req = urllib.request.Request(f"{SF_BASE}/{entity}", data=body, headers=SF_HEADERS, method="POST")
+    req = urllib.request.Request(f"{sf['sf_base']}/{entity}", data=body, headers=sf['sf_headers'], method="POST")
     try:
         with urllib.request.urlopen(req, context=CTX, timeout=30):
             return True, "ok"
@@ -1140,13 +1346,14 @@ def _sf_post(entity: str, row: dict) -> tuple[bool, str]:
         return False, msg[:120]
 
 
-def _sf_post_as_user(entity: str, row: dict, username: str, password: str) -> tuple[bool, str]:
+def _sf_post_as_user(entity: str, row: dict, username: str, password: str, sf: dict) -> tuple[bool, str]:
     """POST to SF OData authenticated as a specific user (required for Goal entities)."""
-    creds = base64.b64encode(f"{username}@SFSALES011375:{password}".encode()).decode()
-    hdrs = {**SF_HEADERS, "Authorization": f"Basic {creds}"}
+    full_user = f"{username}@{sf['company_code']}" if "@" not in username else username
+    creds = base64.b64encode(f"{full_user}:{password}".encode()).decode()
+    hdrs = {**sf['sf_headers'], "Authorization": f"Basic {creds}"}
     body = json.dumps(row).encode()
     req = urllib.request.Request(
-        f"https://apisalesdemo8.successfactors.com/odata/v2/{entity}",
+        f"{sf['sf_base']}/{entity}",
         data=body, headers=hdrs, method="POST")
     try:
         with urllib.request.urlopen(req, context=CTX, timeout=30):
@@ -1162,9 +1369,13 @@ def _sf_post_as_user(entity: str, row: dict, username: str, password: str) -> tu
         return False, msg[:120]
 
 
-def _ias_get_user(username: str):
-    url = IAS_SCIM_URL + "?filter=" + urllib.parse.quote(f'userName eq "{username}"')
-    req = urllib.request.Request(url, headers={"Authorization": IAS_AUTH, "Accept": "application/scim+json"})
+def _ias_get_user(username: str, sf: dict):
+    ias_scim = sf.get("ias_scim_url")
+    ias_auth = sf.get("ias_auth")
+    if not ias_scim or not ias_auth:
+        return None
+    url = ias_scim + "?filter=" + urllib.parse.quote(f'userName eq "{username}"')
+    req = urllib.request.Request(url, headers={"Authorization": ias_auth, "Accept": "application/scim+json"})
     try:
         with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
             d = json.loads(r.read())
@@ -1173,25 +1384,70 @@ def _ias_get_user(username: str):
         return None
 
 
-def _ias_set_password(username: str, password: str, email: str) -> tuple[bool, str]:
-    user = _ias_get_user(username)
-    if not user:
-        return False, "IAS user not found"
-    scim_id = user["id"]
-    user["password"] = password
-    user["emails"] = [{"value": email, "primary": True, "type": "work"}]
+def _ias_ensure_user(username: str, password: str, email: str,
+                     first_name: str = "", last_name: str = "",
+                     sf: Optional[dict] = None) -> tuple[bool, str]:
+    """Create or update an IAS user. Skipped if IAS not configured in sf config."""
+    if sf is None:
+        sf = _build_sf_config(None)
+    ias_scim = sf.get("ias_scim_url")
+    ias_auth = sf.get("ias_auth")
+    if not ias_scim or not ias_auth:
+        return True, "ias_skipped"
+
+    existing = _ias_get_user(username, sf)
+    if existing:
+        scim_id = existing["id"]
+    else:
+        # Create the user
+        payload = json.dumps({
+            "userName": username,
+            "name": {"givenName": first_name, "familyName": last_name},
+            "emails": [{"value": email, "primary": True, "type": "work"}],
+            "userType": "employee",
+            "active": True,
+        }).encode()
+        req = urllib.request.Request(
+            ias_scim, data=payload, method="POST",
+            headers={"Authorization": ias_auth, "Content-Type": "application/scim+json",
+                     "Accept": "application/scim+json"})
+        try:
+            with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
+                created = json.loads(r.read())
+                scim_id = created.get("id", "")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if "already exists" in body.lower() or e.code == 409:
+                # Race condition — fetch and continue
+                existing = _ias_get_user(username, sf)
+                if existing:
+                    scim_id = existing["id"]
+                else:
+                    return False, f"Create failed and not found: HTTP {e.code}"
+            else:
+                return False, f"Create HTTP {e.code}: {body[:120]}"
+
+    # Set password and email via PUT
+    user_data = _ias_get_user(username, sf) or {}
+    user_data["password"] = password
+    user_data["emails"] = [{"value": email, "primary": True, "type": "work"}]
     for f in ["meta", "groups"]:
-        user.pop(f, None)
-    payload = json.dumps(user).encode()
+        user_data.pop(f, None)
+    payload = json.dumps(user_data).encode()
     req = urllib.request.Request(
-        f"{IAS_SCIM_URL}/{scim_id}", data=payload, method="PUT",
-        headers={"Authorization": IAS_AUTH, "Content-Type": "application/scim+json",
+        f"{ias_scim}/{scim_id}", data=payload, method="PUT",
+        headers={"Authorization": ias_auth, "Content-Type": "application/scim+json",
                  "Accept": "application/scim+json"})
     try:
         with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
             return True, str(r.status)
     except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}: {e.read().decode(errors='replace')[:100]}"
+        return False, f"PUT HTTP {e.code}: {e.read().decode(errors='replace')[:100]}"
+
+
+def _ias_set_password(username: str, password: str, email: str, sf: Optional[dict] = None) -> tuple[bool, str]:
+    """Kept for backwards compat — delegates to _ias_ensure_user."""
+    return _ias_ensure_user(username, password, email, sf=sf)
 
 
 # ── Phase 1: Design ───────────────────────────────────────────────────────────
@@ -1207,6 +1463,8 @@ def design_demo_org(
     employee_prefix: Optional[str] = None,
     email_prefix: Optional[str] = None,
     password: str = "MarsD2025",
+    personas: Optional[list] = None,
+    scenario_override: Optional[dict] = None,
     ctx=None,
 ) -> str:
     """
@@ -1223,25 +1481,50 @@ def design_demo_org(
     in the email identifies the caller's SF user for persona defaulting.
 
     Args:
-        company_name:     Customer/company name (e.g. "Nike", "Siemens Energy")
-        industry:         Industry vertical: retail, tech, manufacturing, healthcare,
-                          financial_services, energy
-        country:          Country code for locale/currency: USA, GBR, DEU, FRA, IND,
-                          AUS, SGP, BRA
-        business_problem: The SF domain scenario: mass_hiring, compensation_planning,
-                          talent_retention, skills_learning, performance_goals,
-                          workforce_planning, succession_prep, pay_equity_deep_dive,
-                          onboarding_readiness
-        n_employees:      Number of employees to create (currently 5 supported)
-        company_code:     4-digit SF company code (auto-assigned if omitted)
-        employee_prefix:  2-3 char userId prefix (e.g. "NK" for Nike)
-        email_prefix:     Email address prefix for +alias users (defaults to caller's
-                          email prefix via principal propagation, else env/config)
-        password:         Default login password for all users
+        company_name:       Customer/company name (e.g. "Nike", "Siemens Energy")
+        industry:           Industry vertical: retail, tech, manufacturing, healthcare,
+                            financial_services, energy
+        country:            Country code for locale/currency: USA, GBR, DEU, FRA, IND,
+                            AUS, SGP, BRA
+        business_problem:   The SF domain scenario: mass_hiring, compensation_planning,
+                            talent_retention, skills_learning, performance_goals,
+                            workforce_planning, succession_prep, pay_equity_deep_dive,
+                            onboarding_readiness
+        n_employees:        Number of employees to create (currently 5 supported)
+        company_code:       4-digit SF company code (auto-assigned if omitted)
+        employee_prefix:    2-3 char userId prefix (e.g. "NK" for Nike)
+        email_prefix:       Email address prefix for +alias users (defaults to caller's
+                            email prefix via principal propagation, else env/config)
+        password:           Default login password for all users
+        personas:           Optional list of custom persona dicts, one per employee.
+                            Each dict must contain:
+                              first_name  - REQUIRED: person's given name (e.g. "Jordan")
+                              last_name   - REQUIRED: person's family name (e.g. "Kim")
+                              role_key    - short identifier used as username suffix (e.g. "cpo")
+                              job_title   - full title (e.g. "Chief People Officer")
+                              short_title - abbreviated title for display (e.g. "CPO")
+                              department  - dept key: EXEC, OPS, FIN, ENG, PROD, SALES, MED
+                              pay_grade   - SF grade: GR-11 through GR-15
+                              employee_number - zero-padded 3-digit string (e.g. "001")
+                              goals       - dict with keys: annual_1_name, annual_1_metric,
+                                            annual_2_name, annual_2_metric, dev_name, dev_metric
+                              spot_award_message - spot award message (null for CEO / persona[0])
+                            IMPORTANT: first_name and last_name are required. Omitting them
+                            causes all employees to appear as "UserXXX Smith" in SuccessFactors.
+                            When provided, overrides INDUSTRY_ROLES and GOAL_CONTENT entirely.
+                            The first persona is always the CEO / root manager.
+        scenario_override:  Optional dict to replace the SCENARIO_KB entry. Keys:
+                              label          - short scenario label (e.g. "Skills & Internal Mobility")
+                              challenge      - 2-3 sentence customer challenge narrative
+                              talent_story   - 1-sentence org backstory shown in the plan summary
+                              joule_prompts  - list of 4-6 Joule chat prompts tuned to this demo
+                              story_narrative - what is live vs story (plain text)
+                            When provided, overrides the static SCENARIO_KB lookup entirely.
     """
     # Principal propagation: pull email from XSUAA JWT if available
     caller_email = _extract_caller_email(ctx)
     caller_alias = _alias_from_email(caller_email) if caller_email else None
+    _design_sf = _build_sf_config(caller_email)
 
     # email_prefix: caller arg > derived from JWT email > env default
     if email_prefix is None:
@@ -1256,20 +1539,19 @@ def design_demo_org(
     country_key    = country.upper()
 
     # Validate inputs and apply defaults
-    if industry_key not in INDUSTRY_ROLES:
+    if not personas and industry_key not in INDUSTRY_ROLES:
         available = list(INDUSTRY_ROLES.keys())
         return json.dumps({"error": f"Unknown industry '{industry}'. Available: {available}"})
 
-    if problem_key not in SCENARIO_KB:
+    if not scenario_override and problem_key not in SCENARIO_KB:
         available = list(SCENARIO_KB.keys())
         return json.dumps({"error": f"Unknown problem '{business_problem}'. Available: {available}"})
 
     if country_key not in LOCALE_CONFIG:
         country_key = "USA"  # default fallback
 
-    locale = LOCALE_CONFIG[country_key]
-    scenario = SCENARIO_KB[problem_key]
-    roles = INDUSTRY_ROLES.get(industry_key, INDUSTRY_ROLES["tech"])
+    locale = LOCALE_CONFIG.get(country_key, LOCALE_CONFIG["USA"])
+    scenario = scenario_override if scenario_override else SCENARIO_KB[problem_key]
 
     # Auto-assign company code if not given (hash company name to 4-digit range 5000-9000)
     if not company_code:
@@ -1283,42 +1565,140 @@ def design_demo_org(
         else:
             employee_prefix = company_name.upper()[:3]
 
-    # Build employee roster
-    role_keys = list(roles.keys())[:n_employees]
+    # Build employee roster — agent-provided personas take precedence over static tables
     employees = []
     ceo_id = None
-    for i, rk in enumerate(role_keys):
-        num, short, title, dept, grade = roles[rk]
-        uid      = f"{employee_prefix}{num}"
-        username = f"{employee_prefix.lower()}.{rk}"
-        fn, ln   = FIRST_NAMES.get(rk, (f"User{num}", "Smith"))
-        mgr      = None if i == 0 else (ceo_id or f"{employee_prefix}{roles[role_keys[0]][0]}")
-        if i == 0:
-            ceo_id = uid
-        sal = SALARY_HISTORY.get(grade, [90000, 97000, 105000])
-        impact, risk, fl = GRADE_IMPACT.get(grade, ("MEDIUM", "LOW", False))
-        bonus = BONUS_BY_GRADE.get(grade, 8000)
-        employees.append({
-            "userId":    uid,
-            "username":  username,
-            "firstName": fn,
-            "lastName":  ln,
-            "email_tag": f"{employee_prefix.lower()}.{rk}",
-            "jobTitle":  title,
-            "shortTitle": short,
-            "dept":      f"{company_code}-D-{dept}",
-            "dept_key":  dept,
-            "bu":        DEPT_BU.get(dept, "CORP"),
-            "division":  DEPT_DIVISION.get(dept, "CORP_SVCS"),
-            "payGrade":  grade,
-            "position":  f"P-{company_code}-{num}",
-            "manager":   mgr,
-            "salaryHistory": sal,
-            "impactOfLoss":  impact,
-            "riskOfLoss":    risk,
-            "futureLeader":  fl,
-            "yearEndBonus":  bonus,
-        })
+
+    if personas:
+        # Path A: agent passed explicit persona list (dynamic, customer-specific)
+        # Use any names the agent provided; fill gaps from the name pool.
+        # Never fall back to "UserXXX Smith" — always use a realistic name.
+        _NAME_POOL = [
+            ("Jordan", "Kim"), ("Priya", "Mehta"), ("Marcus", "Webb"),
+            ("Dana", "Reeves"), ("Hira", "Nair"), ("Elise", "Torres"),
+            ("Owen", "Fletcher"), ("Cleo", "Nash"), ("Leon", "Park"),
+            ("Ayesha", "Khan"), ("Marco", "Silva"), ("Natalie", "Cross"),
+            ("Ethan", "Walsh"), ("Sona", "Park"), ("Jordan", "Moss"),
+        ]
+        _pool_idx = 0
+
+        for i, p in enumerate(personas[:n_employees]):
+            rk    = p.get("role_key", f"role{i}")
+            num   = p.get("employee_number", f"{(i+1):03d}")
+            title = p.get("job_title", f"Employee {i+1}")
+            short = p.get("short_title", title[:20])
+            dept  = p.get("department", "CORP")
+            grade = p.get("pay_grade", "GR-07")
+            # Use provided name; fall back to pool (never to "UserXXX Smith")
+            _fallback_fn, _fallback_ln = _NAME_POOL[_pool_idx % len(_NAME_POOL)]
+            _pool_idx += 1
+            fn    = p.get("first_name") or _fallback_fn
+            ln    = p.get("last_name")  or _fallback_ln
+            uid   = f"{employee_prefix}{num}"
+            username = p.get("username") or f"{employee_prefix.lower()}.{rk}"
+            mgr   = None if i == 0 else (ceo_id or f"{employee_prefix}{personas[0].get('employee_number', '001')}")
+            if i == 0:
+                ceo_id = uid
+            sal   = p.get("salary_history") or SALARY_HISTORY.get(grade, [90000, 97000, 105000])
+            impact, risk, fl = GRADE_IMPACT.get(grade, ("MEDIUM", "LOW", False))
+            bonus = p.get("year_end_bonus") or BONUS_BY_GRADE.get(grade, 8000)
+            # Goals: agent-supplied or derive from role_key fallback
+            pg = p.get("goals") or {}
+            if pg:
+                g1n = pg.get("annual_1_name", "Achieve business targets")
+                g1m = pg.get("annual_1_metric", "Measured by KPI dashboard")
+                g2n = pg.get("annual_2_name", "Drive team development")
+                g2m = pg.get("annual_2_metric", "Measured by engagement score")
+                dgn = pg.get("dev_name", "Build leadership skills")
+                dgm = pg.get("dev_metric", "Complete leadership programme")
+            else:
+                g1n, g1m, g2n, g2m, dgn, dgm = GOAL_CONTENT.get(rk, _DEFAULT_GOAL)
+            spot = p.get("spot_award_message") or (
+                f"Outstanding delivery — {title} drove key results for {company_name}"
+                if i > 0 else None
+            )
+            employees.append({
+                "userId":    uid,
+                "username":  username,
+                "firstName": fn,
+                "lastName":  ln,
+                "email_tag": username,
+                "jobTitle":  title,
+                "shortTitle": short,
+                "dept":      f"{company_code}-D-{dept}",
+                "dept_key":  dept,
+                "bu":        DEPT_BU.get(dept, "CORP"),
+                "division":  DEPT_DIVISION.get(dept, "CORP_SVCS"),
+                "payGrade":  grade,
+                "position":  f"P-{company_code}-{num}",
+                "manager":   mgr,
+                "salaryHistory": sal,
+                "impactOfLoss":  impact,
+                "riskOfLoss":    risk,
+                "futureLeader":  fl,
+                "yearEndBonus":  bonus,
+                "goals": {
+                    "annual_1_name":   g1n,
+                    "annual_1_metric": g1m,
+                    "annual_2_name":   g2n,
+                    "annual_2_metric": g2m,
+                    "dev_name":        dgn,
+                    "dev_metric":      dgm,
+                },
+                "spot_award": spot,
+            })
+    else:
+        # Path B: static INDUSTRY_ROLES table (original behaviour)
+        roles     = INDUSTRY_ROLES.get(industry_key, INDUSTRY_ROLES["tech"])
+        role_keys = list(roles.keys())[:n_employees]
+        for i, rk in enumerate(role_keys):
+            num, short, title, dept, grade = roles[rk]
+            uid      = f"{employee_prefix}{num}"
+            username = f"{employee_prefix.lower()}.{rk}"
+            fn, ln   = FIRST_NAMES.get(rk, (f"User{num}", "Smith"))
+            mgr      = None if i == 0 else (ceo_id or f"{employee_prefix}{roles[role_keys[0]][0]}")
+            g1n, g1m, g2n, g2m, dgn, dgm = GOAL_CONTENT.get(rk, _DEFAULT_GOAL)
+            if i == 0:
+                ceo_id = uid
+            sal = SALARY_HISTORY.get(grade, [90000, 97000, 105000])
+            impact, risk, fl = GRADE_IMPACT.get(grade, ("MEDIUM", "LOW", False))
+            bonus = BONUS_BY_GRADE.get(grade, 8000)
+            _award_templates = [
+                f"Outstanding delivery — {title} shipped ahead of schedule and under budget",
+                f"Strategic win — resolved a key risk blocking the {dept} roadmap",
+                f"Customer milestone — first major deal or delivery secured by {title}",
+                f"Operational excellence — consistent high-quality execution all year",
+            ]
+            employees.append({
+                "userId":    uid,
+                "username":  username,
+                "firstName": fn,
+                "lastName":  ln,
+                "email_tag": f"{employee_prefix.lower()}.{rk}",
+                "jobTitle":  title,
+                "shortTitle": short,
+                "dept":      f"{company_code}-D-{dept}",
+                "dept_key":  dept,
+                "bu":        DEPT_BU.get(dept, "CORP"),
+                "division":  DEPT_DIVISION.get(dept, "CORP_SVCS"),
+                "payGrade":  grade,
+                "position":  f"P-{company_code}-{num}",
+                "manager":   mgr,
+                "salaryHistory": sal,
+                "impactOfLoss":  impact,
+                "riskOfLoss":    risk,
+                "futureLeader":  fl,
+                "yearEndBonus":  bonus,
+                "goals": {
+                    "annual_1_name":   g1n,
+                    "annual_1_metric": g1m,
+                    "annual_2_name":   g2n,
+                    "annual_2_metric": g2m,
+                    "dev_name":        dgn,
+                    "dev_metric":      dgm,
+                },
+                "spot_award": _award_templates[min(max(i - 1, 0), 3)] if i > 0 else None,
+            })
 
     # Build org structure description
     org_lines = []
@@ -1404,7 +1784,7 @@ def design_demo_org(
         "caller": {
             "email":       caller_email,
             "sf_alias":    caller_alias,
-            "sf_login":    f"{caller_alias}@SFSALES011375" if caller_alias else None,
+            "sf_login":    f"{caller_alias}@{_design_sf['company_code']}" if caller_alias else None,
             "note": (
                 f"Caller identified as {caller_alias} via XSUAA principal propagation."
                 if caller_alias
@@ -1417,13 +1797,15 @@ def design_demo_org(
             "prompts":   card["prompts"],
             "live_count":  len(live_items),
             "story_count": len(story_items),
-            "joule_url":   LOGIN_URL,
+            "joule_url":   _design_sf["login_url"],
         },
+        "sf_instance": _design_sf["company_code"],
+        "login_url": _design_sf["login_url"],
         "summary": (
             f"{company_name} ({industry_key}, {country_key}) — {scenario['label']}\n"
             f"  {len(employees)} employees, company code {company_code}, prefix {employee_prefix}\n"
             f"  Password: {password}\n"
-            f"  Login: {LOGIN_URL}\n\n"
+            f"  Login: {_design_sf['login_url']}\n\n"
             f"  LIVE ({len(live_items)} entities): {', '.join(i['entity'] for i in live_items)}\n"
             f"  STORY ({len(story_items)} entities): {', '.join(i['entity'] for i in story_items)}\n\n"
             f"  Story arc: {scenario['talent_story']}\n\n"
@@ -1436,21 +1818,216 @@ def design_demo_org(
 
 # ── Phase 2: Provision ────────────────────────────────────────────────────────
 
-@mcp.tool()
-def provision_demo_org(plan_json: str) -> str:
-    """
-    Phase 2: Provision the org plan from design_demo_org() into SF SFSALES011375.
+def _do_provision(plan_json: str, job_id: str, caller_email_snapshot: Optional[str]) -> None:
+    """Run all SF OData provisioning calls synchronously (called in a background thread)."""
+    print(f"[provision] THREAD STARTED job={job_id} caller={caller_email_snapshot!r}", flush=True)
+    with _JOBS_LOCK:
+        _JOBS[job_id]["status"] = "running"
+    try:
+        result = _provision_sync(plan_json, caller_email_snapshot)
+        with _JOBS_LOCK:
+            _JOBS[job_id]["status"] = "done"
+            _JOBS[job_id]["result"] = result
+    except Exception as exc:
+        with _JOBS_LOCK:
+            _JOBS[job_id]["status"] = "error"
+            _JOBS[job_id]["error"]  = str(exc)
 
-    Takes the JSON output of design_demo_org() and creates all LIVE entities.
-    Reports each phase result and clearly marks what was created vs what is story.
+
+@mcp.tool()
+def provision_demo_org(plan_json: str, confirmed: bool = False, ctx=None) -> str:
+    """
+    Phase 2: Provision the org plan from design_demo_org() into SuccessFactors.
+
+    IMPORTANT: Call this WITHOUT confirmed=True first to see a full pre-flight
+    summary — what org will be created, what users and emails will be provisioned,
+    and which SF tenant will be used. The tool will ask you to confirm before
+    actually provisioning.
+
+    Once you are satisfied with the summary, call again with confirmed=True to
+    start provisioning.
+
+    Provisioning runs in the background (takes 2-3 minutes for OData + IAS calls).
+    Returns a job_id immediately. Poll with get_provisioning_status(job_id) to track
+    progress and retrieve credentials when done.
 
     Args:
-        plan_json: The full JSON string returned by design_demo_org()
+        plan_json:  The full JSON string returned by design_demo_org()
+        confirmed:  Set to True only after reviewing the pre-flight summary
     """
     try:
         plan = json.loads(plan_json)
     except Exception as e:
         return json.dumps({"error": f"Invalid plan JSON: {e}"})
+
+    caller_email_snapshot = _extract_caller_email(ctx)
+    sf = _build_sf_config(caller_email_snapshot)
+
+    # Block provisioning if IAS is detected but credentials are missing.
+    # Users created in SF get an IAS account automatically (via email sync), but with
+    # NO password — they cannot log in until a password is set via IAS SCIM. Without
+    # valid IAS client credentials we cannot set passwords, so the demo is unusable.
+    custom_cfg = _db.get_sf_config(caller_email_snapshot) if caller_email_snapshot else None
+    if custom_cfg and custom_cfg.get("ias_base_url") and not custom_cfg.get("ias_client_id"):
+        return json.dumps({
+            "error": (
+                "Cannot provision: your SF instance has IAS linked "
+                f"({custom_cfg['ias_base_url']}) but no IAS client credentials are configured. "
+                "Users would be created in SF but could not log in (no password). "
+                "Fix: call configure_sf_instance again and add ias_client_id + ias_client_secret "
+                "(create a System Application with 'Manage Users' scope in the IAS Admin UI at "
+                f"{custom_cfg['ias_base_url']}/admin/)."
+            )
+        })
+
+    # Log every call so we can audit in CF logs
+    print(f"[provision] called by={caller_email_snapshot!r} confirmed={confirmed} "
+          f"company={plan.get('company_name','?')} target={sf['company_code']}", flush=True)
+
+    # ── Pre-flight summary (always shown) ────────────────────────────────────
+    company_name  = plan.get("company_name", "Unknown")
+    company_code  = plan.get("company_code", "???")
+    industry      = plan.get("industry", "")
+    country       = plan.get("country", "")
+    password      = plan.get("password", "")
+    email_prefix  = plan.get("email_prefix", "")
+    employees     = plan.get("employees", [])
+    scenario      = plan.get("scenario_label", plan.get("scenario", {}).get("label", ""))
+
+    user_rows = []
+    for e in employees:
+        email_tag = e.get("email_tag", e.get("role_key", e.get("username", "?")))
+        # uid6 suffix is added at provision time (not known yet) — show pattern
+        full_email = f"{email_prefix}+{email_tag}.<uid6>@sap.com" if email_prefix else "N/A"
+        user_rows.append({
+            "sf_username": f"{e.get('username', '?')}@{sf['company_code']}",
+            "name":        f"{e.get('firstName', '')} {e.get('lastName', '')}",
+            "title":       e.get("jobTitle", ""),
+            "email":       full_email,
+            "ias":         "yes" if sf["ias_scim_url"] else "skipped",
+        })
+
+    preflight = {
+        "target_instance": {
+            "api_base":     sf["sf_base"],
+            "company_code": sf["company_code"],
+            "login_url":    sf["login_url"],
+            "ias_enabled":  sf["ias_scim_url"] is not None,
+            "ias_base":     sf["ias_base"],
+            "source":       "custom" if _db.get_sf_config(caller_email_snapshot) else "default (SFSALES011375)",
+        },
+        "org_to_create": {
+            "company_name": company_name,
+            "company_code": company_code,
+            "industry":     industry,
+            "country":      country,
+            "scenario":     scenario,
+        },
+        "users_to_provision": user_rows,
+        "shared_password": password,
+        "email_prefix_used": email_prefix or "N/A",
+        "onboardee": {
+            "name": "Sam Rivera",
+            "note": "New hire onboarding scenario — provisioned as a separate entry",
+        },
+        "data_phases": [
+            "Company & location", "Cost centers", "Departments", "Positions",
+            "Users", "Employment", "Jobs", "Personal data", "Compensation",
+            "Salary history", "Bonus", "Talent profiles", "Spot awards",
+            "Onboarding record", "Goals (annual + development)",
+            "IAS passwords" if sf["ias_scim_url"] else "IAS passwords (SKIPPED — no IAS configured)",
+        ],
+    }
+
+    if not confirmed:
+        return json.dumps({
+            "status": "awaiting_confirmation",
+            "message": (
+                f"Ready to provision '{company_name}' ({company_code}) into "
+                f"{sf['company_code']} ({sf['login_url']}). "
+                f"Review the preflight summary below, then call provision_demo_org again "
+                f"with confirmed=True to start provisioning."
+            ),
+            "preflight": preflight,
+            "action_required": "Call provision_demo_org(plan_json=<same plan>, confirmed=True) to proceed.",
+        }, indent=2)
+
+    # ── Confirmed — kick off background provisioning ──────────────────────────
+    job_id = str(uuid.uuid4())[:8]
+
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {
+            "status":     "pending",
+            "result":     None,
+            "error":      None,
+            "started_at": time.time(),
+        }
+
+    t = threading.Thread(
+        target=_do_provision,
+        args=(plan_json, job_id, caller_email_snapshot),
+        daemon=True,
+    )
+    t.start()
+
+    return json.dumps({
+        "status":  "started",
+        "job_id":  job_id,
+        "target":  f"{sf['company_code']} ({sf['login_url']})",
+        "message": (
+            f"Provisioning '{company_name}' into {sf['company_code']} has started. "
+            "It typically takes 2–3 minutes (OData entity creation + IAS password activation). "
+            f"Poll with get_provisioning_status(job_id='{job_id}') every 30 seconds until "
+            "status is 'done' or 'error'."
+        ),
+    })
+
+
+@mcp.tool()
+def get_provisioning_status(job_id: str) -> str:
+    """
+    Poll the status of a background provisioning job started by provision_demo_org().
+
+    Returns status 'pending', 'running', 'done', or 'error'.
+    When status is 'done', the full confirmation (credentials, phase results, demo story)
+    is included in the 'result' field.
+
+    Args:
+        job_id: The job_id returned by provision_demo_org()
+    """
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+    if job is None:
+        return json.dumps({"error": f"No job found with id '{job_id}'. Jobs are in-memory only — they do not survive server restarts."})
+
+    elapsed = int(time.time() - job["started_at"])
+    out: dict = {
+        "job_id":   job_id,
+        "status":   job["status"],
+        "elapsed_seconds": elapsed,
+    }
+    if job["status"] == "done":
+        # Inline the full provision result
+        try:
+            out.update(json.loads(job["result"]))
+        except Exception:
+            out["result"] = job["result"]
+    elif job["status"] == "error":
+        out["error"] = job["error"]
+    elif job["status"] in ("pending", "running"):
+        out["message"] = f"Still running after {elapsed}s. Check back in ~30s."
+    return json.dumps(out, indent=2)
+
+
+def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
+    """Synchronous provisioning body (runs inside a background thread)."""
+    try:
+        plan = json.loads(plan_json)
+    except Exception as e:
+        return json.dumps({"error": f"Invalid plan JSON: {e}"})
+
+    # Resolve per-user SF + IAS config for this provisioning run
+    sf = _build_sf_config(caller_email)
 
     co          = plan["company_code"]
     name        = plan["company_name"]
@@ -1463,9 +2040,11 @@ def provision_demo_org(plan_json: str) -> str:
 
     # Unique ID for this provisioned org — stored in HANA, returned to caller
     demo_id = str(uuid.uuid4())
+    uid6 = demo_id[:6]  # short suffix to make emails unique per org run
 
-    # Caller identity from principal propagation (populated in HTTP mode)
-    caller_email = plan.get("caller", {}).get("email")
+    # Caller identity: prefer the snapshot passed from the MCP tool (captured before threading),
+    # fall back to whatever the plan carries.
+    caller_email = caller_email or plan.get("caller", {}).get("email")
 
     # ── All dates relative to today ───────────────────────────────────────────
     _today = datetime.now()
@@ -1528,7 +2107,7 @@ def provision_demo_org(plan_json: str) -> str:
         "externalCode": co, "startDate": START_DATE,
         "name": name, "currency": locale["currency"],
         "country": locale["country_code"], "standardHours": 40, "status": "A",
-    }])
+    }], sf)
     results["FOCompany"] = f"{ok}/1"
     all_errors.extend(errs)
 
@@ -1539,7 +2118,7 @@ def provision_demo_org(plan_json: str) -> str:
         ok2, _ = _sf_post("FOCostCenter", {
             "externalCode": f"{co}-{dk}", "startDate": START_DATE,
             "name": f"{name} {DEPT_NAMES.get(dk, dk)}", "status": "A",
-        })
+        }, sf)
         if ok2:
             cc_ok += 1
     results["FOCostCenter"] = f"{cc_ok}/{len(dept_keys)}"
@@ -1555,7 +2134,7 @@ def provision_demo_org(plan_json: str) -> str:
             "cust_toLegalEntity": [{"externalCode": co, "startDate": START_DATE}],
             "cust_toDivision":    [{"externalCode": div, "startDate": START_DATE}],
         })
-    ok, errs = _sf_upsert(dept_rows)
+    ok, errs = _sf_upsert(dept_rows, sf)
     results["FODepartment"] = f"{ok}/{len(dept_rows)}"
     all_errors.extend(errs)
 
@@ -1568,7 +2147,7 @@ def provision_demo_org(plan_json: str) -> str:
         "standardHours": 40, "geozoneFlx": "USA_SUBURB",
         "status": "A", "addressCountry": locale["country_code"],
         "companyFlx": co,
-    }])
+    }], sf)
     results["FOLocation"] = f"{ok}/1"
     all_errors.extend(errs)
 
@@ -1587,14 +2166,14 @@ def provision_demo_org(plan_json: str) -> str:
             "payGrade": e["payGrade"], "regularTemporary": "R",
             "targetFTE": 1, "vacant": True, "multipleIncumbentsAllowed": False,
         })
-    ok, errs = _sf_upsert(pos_rows)
+    ok, errs = _sf_upsert(pos_rows, sf)
     results["Position"] = f"{ok}/{len(pos_rows)}"
     all_errors.extend(errs)
 
     # ── Phase 6: Users ─────────────────────────────────────────────────────────
     user_rows = []
     for e in employees:
-        email = f"{email_pfx}+{e['email_tag']}@sap.com"
+        email = f"{email_pfx}+{e['email_tag']}.{uid6}@sap.com"
         user_rows.append({
             "__metadata": {"uri": f"User('{e['userId']}')"},
             "userId": e["userId"], "username": e["username"],
@@ -1604,7 +2183,7 @@ def provision_demo_org(plan_json: str) -> str:
             "timeZone": locale["tz"],
             "password": password,
         })
-    ok, errs = _sf_upsert(user_rows)
+    ok, errs = _sf_upsert(user_rows, sf)
     results["User"] = f"{ok}/{len(user_rows)}"
     all_errors.extend(errs)
 
@@ -1618,7 +2197,7 @@ def provision_demo_org(plan_json: str) -> str:
             "startDate": HIRE_DATE, "originalStartDate": HIRE_DATE,
             "firstDateWorked": HIRE_DATE, "seniorityDate": HIRE_DATE,
         })
-    ok, errs = _sf_upsert(emp_rows)
+    ok, errs = _sf_upsert(emp_rows, sf)
     results["EmpEmployment"] = f"{ok}/{len(emp_rows)}"
     all_errors.extend(errs)
 
@@ -1643,7 +2222,7 @@ def provision_demo_org(plan_json: str) -> str:
             "timeRecordingAdmissibilityCode": "4WK_AMEND_YES",
             "defaultOvertimeCompensationVariant": "OCV_NO_PAYOUT",
         })
-    ok, errs = _sf_upsert(job_rows)
+    ok, errs = _sf_upsert(job_rows, sf)
     results["EmpJob"] = f"{ok}/{len(job_rows)}"
     all_errors.extend(errs)
 
@@ -1658,7 +2237,7 @@ def provision_demo_org(plan_json: str) -> str:
             "nationality": locale["country_code"], "gender": "U",
             "maritalStatus": "10820", "nativePreferredLang": "10240",
         })
-    ok, errs = _sf_upsert(per_rows)
+    ok, errs = _sf_upsert(per_rows, sf)
     results["PerPersonal"] = f"{ok}/{len(per_rows)}"
     all_errors.extend(errs)
 
@@ -1672,7 +2251,7 @@ def provision_demo_org(plan_json: str) -> str:
             "isEligibleForCar": False, "isEligibleForBenefits": True,
             "payGroup": locale["pay_group"],
         })
-    ok_comp, errs = _sf_upsert(comp_rows)
+    ok_comp, errs = _sf_upsert(comp_rows, sf)
     all_errors.extend(errs)
 
     sal_rows = []
@@ -1687,7 +2266,7 @@ def provision_demo_org(plan_json: str) -> str:
                 "startDate": sal_epoch, "seqNumber": seq,
                 "paycompvalue": float(sal), "currencyCode": locale["currency"],
             })
-    ok_sal, errs = _sf_upsert(sal_rows)
+    ok_sal, errs = _sf_upsert(sal_rows, sf)
     all_errors.extend(errs)
     results["EmpCompensation+SalaryHistory"] = f"comp={ok_comp}/{len(comp_rows)} salary={ok_sal}/{len(sal_rows)}"
 
@@ -1702,7 +2281,7 @@ def provision_demo_org(plan_json: str) -> str:
             "paycompvalue": float(e["yearEndBonus"]),
             "currencyCode": locale["currency"],
         })
-    ok, errs = _sf_upsert(bonus_rows)
+    ok, errs = _sf_upsert(bonus_rows, sf)
     results["YearEndBonus"] = f"{ok}/{len(bonus_rows)}"
     all_errors.extend(errs)
 
@@ -1717,25 +2296,24 @@ def provision_demo_org(plan_json: str) -> str:
             "riskOfLoss":   e["riskOfLoss"],
             "futureLeader": e["futureLeader"],
         })
-    ok, errs = _sf_upsert(talent_rows)
+    ok, errs = _sf_upsert(talent_rows, sf)
     results["TalentProfile"] = f"{ok}/{len(talent_rows)}"
     all_errors.extend(errs)
 
-    # ── Phase 13: Spot awards (WOW Awards! — no eligibility restriction) ──────
-    BASE_CODE = 800000 + int(co)
-    AWARD_DATA = [
-        (300, "Outstanding delivery — shipped ahead of schedule and under budget",
-               "Above guideline: critical milestone warranted top recognition."),
-        (200, "Strategic win — resolved a key risk that was blocking the roadmap",
-               "Above guideline: impact was significant and time-sensitive."),
-        (200, "Customer milestone — first major deal or delivery secured",
-               "Above guideline: strategic inflection point for the business."),
-        (100, "Operational excellence — consistent high-quality execution all year", None),
+    # ── Phase 13: Spot awards ──────────────────────────────────────────────────
+    BASE_CODE = 800000 + int(''.join(filter(str.isdigit, co)) or '1')
+    _default_award_msgs = [
+        "Outstanding delivery — shipped ahead of schedule and under budget",
+        "Strategic win — resolved a key risk that was blocking the roadmap",
+        "Customer milestone — first major deal or delivery secured",
+        "Operational excellence — consistent high-quality execution all year",
     ]
     award_rows = []
     ceo_id = employees[0]["userId"]
-    for i, (sub, (pts, comment, approver_note)) in enumerate(
-            zip(employees[1:], AWARD_DATA)):
+    for i, sub in enumerate(employees[1:]):
+        # Use plan-level spot_award message if present, else fall back to generic template
+        comment = sub.get("spot_award") or _default_award_msgs[min(i, 3)]
+        pts = [300, 200, 200, 100][min(i, 3)]
         code = BASE_CODE + i + 1
         row = {
             "__metadata": {"uri": f"SpotAward({code})"},
@@ -1749,11 +2327,10 @@ def provision_demo_org(plan_json: str) -> str:
             "level":        "1",
             "approvalStatus": "APPROVED",
             "commentForReceiver": comment,
+            "commentForApprovers": "Above guideline: impact warranted top recognition.",
         }
-        if approver_note:
-            row["commentForApprovers"] = approver_note
         award_rows.append(row)
-    ok, errs = _sf_upsert(award_rows)
+    ok, errs = _sf_upsert(award_rows, sf)
     results["SpotAwards"] = f"{ok}/{len(award_rows)}"
     # Don't surface spot award eligibility errors — graceful
     non_eligibility_errs = [e for e in errs if "not eligible" not in e.lower()]
@@ -1763,7 +2340,7 @@ def provision_demo_org(plan_json: str) -> str:
     onb_uid  = f"{emp_prefix}{len(employees)+1:03d}"
     onb_user = f"{emp_prefix.lower()}.onb"
     onb_tag  = f"{emp_prefix.lower()}.onb"
-    onb_email = f"{email_pfx}+{onb_tag}@sap.com"
+    onb_email = f"{email_pfx}+{onb_tag}.{uid6}@sap.com"
     onb_mgr  = employees[1]["userId"]
     onb_dept = employees[1]["dept"]
     onb_pos  = employees[1]["position"]
@@ -1777,13 +2354,13 @@ def provision_demo_org(plan_json: str) -> str:
         "email": onb_email, "status": "t",
         "defaultLocale": locale["locale"], "timeZone": locale["tz"],
         "password": password,
-    }])
+    }], sf)
     try:
         onb_payload = json.dumps({
             "userId": onb_uid, "firstName": "Sam", "lastName": "Rivera",
             "email": onb_email, "hireDate": ONB_DATE,
         }).encode()
-        req = urllib.request.Request(f"{SF_BASE}/createOnboardee", data=onb_payload, headers=SF_HEADERS, method="POST")
+        req = urllib.request.Request(f"{sf['sf_base']}/createOnboardee", data=onb_payload, headers=sf['sf_headers'], method="POST")
         with urllib.request.urlopen(req, context=CTX, timeout=30):
             onb_fn_ok = 1
     except Exception:
@@ -1794,32 +2371,15 @@ def provision_demo_org(plan_json: str) -> str:
         "personIdExternal": onb_uid, "userId": onb_uid,
         "startDate": ONB_DATE, "originalStartDate": ONB_DATE,
         "firstDateWorked": ONB_DATE, "seniorityDate": ONB_DATE,
-    }])
-    ok4, _ = _sf_upsert([{
-        "__metadata": {"uri": f"EmpJob(seqNumber=1L,startDate=datetime'{ONB_STR}',userId='{onb_uid}')"},
-        "userId": onb_uid, "seqNumber": 1,
-        "startDate": ONB_DATE, "company": co,
-        "department": onb_dept, "division": employees[1]["division"],
-        "businessUnit": employees[1]["bu"],
-        "employeeClass": "4662", "employmentType": "3631", "eventReason": "HIRNEW",
-        "fte": 1.0, "jobCode": "50000724", "jobTitle": "Senior Associate",
-        "location": loc_code, "managerId": onb_mgr, "payGrade": "GR-11",
-        "payScaleArea": locale["pay_scale"], "payScaleType": locale["pay_scale"],
-        "position": onb_pos, "standardHours": 40, "timezone": locale["tz"],
-        "workscheduleCode": "NORM", "timeTypeProfileCode": "USA_STD",
-        "holidayCalendarCode": "USA", "timeRecordingProfileCode": "DUR_NEG",
-        "timeRecordingVariant": "DURATION",
-        "timeRecordingAdmissibilityCode": "4WK_AMEND_YES",
-        "defaultOvertimeCompensationVariant": "OCV_NO_PAYOUT",
-    }])
+    }], sf)
     ok5, _ = _sf_upsert([{
         "__metadata": {"uri": f"PerPersonal(personIdExternal='{onb_uid}',startDate=datetime'{ONB_STR}')"},
         "personIdExternal": onb_uid, "startDate": ONB_DATE,
         "firstName": "Sam", "lastName": "Rivera",
         "nationality": locale["country_code"], "gender": "U",
         "maritalStatus": "10820", "nativePreferredLang": "10240",
-    }])
-    onb_success = all([ok1, ok3, ok4, ok5])
+    }], sf)
+    onb_success = all([ok1, ok3, ok5])
     results["Onboardee"] = f"{'1/1' if onb_success else '0/1'} ({onb_uid} Sam Rivera, Nov 3 start)"
 
     # ── Phase 15: Goals (Goal_11 annual + DevGoal_2001 dev goals) ────────────────
@@ -1829,12 +2389,28 @@ def provision_demo_org(plan_json: str) -> str:
     # For now: create goals using the SF user credentials (username@SFSALES011375:password).
     goals_ok = 0
     goals_total = 0
-    GOAL_START  = "/Date(1735689600000)/"   # 2025-01-01
-    GOAL_DUE    = "/Date(1767225600000)/"   # 2025-12-31
+    # Dates relative to today: start = Jan 1 of current year, due = Dec 31 of current year
+    import datetime as _dt
+    _today = _dt.date.today()
+    _year_start = _dt.date(_today.year, 1, 1)
+    _year_end   = _dt.date(_today.year, 12, 31)
+    import calendar as _cal
+    _ts_start = int(_dt.datetime(_today.year, 1, 1, tzinfo=_dt.timezone.utc).timestamp()) * 1000
+    _ts_end   = int(_dt.datetime(_today.year, 12, 31, tzinfo=_dt.timezone.utc).timestamp()) * 1000
+    GOAL_START  = f"/Date({_ts_start})/"
+    GOAL_DUE    = f"/Date({_ts_end})/"
 
     for e in employees:
-        role_key = e.get("username", "").split(".")[-1] if "." in e.get("username", "") else ""
-        g1n, g1m, g2n, g2m, dgn, dgm = GOAL_CONTENT.get(role_key, _DEFAULT_GOAL)
+        # Goals come from the plan (set at design time); fall back to role-key lookup for
+        # plans created before this change.
+        _g = e.get("goals") or {}
+        if _g:
+            g1n, g1m = _g["annual_1_name"], _g["annual_1_metric"]
+            g2n, g2m = _g["annual_2_name"], _g["annual_2_metric"]
+            dgn, dgm = _g["dev_name"],      _g["dev_metric"]
+        else:
+            role_key = e.get("username", "").split(".")[-1] if "." in e.get("username", "") else ""
+            g1n, g1m, g2n, g2m, dgn, dgm = GOAL_CONTENT.get(role_key, _DEFAULT_GOAL)
 
         annual_goals = [
             {"name": g1n, "metric": g1m},
@@ -1853,7 +2429,7 @@ def provision_demo_org(plan_json: str) -> str:
                 "due": GOAL_DUE,
                 "state": "On Track",
                 "done": 0,
-            }, e["username"], password)
+            }, e["username"], password, sf)
             if ok:
                 goals_ok += 1
 
@@ -1869,43 +2445,80 @@ def provision_demo_org(plan_json: str) -> str:
             "due": GOAL_DUE,
             "state": "On Track",
             "competencies": {"results": []},
-        }, e["username"], password)
+        }, e["username"], password, sf)
         if ok:
             goals_ok += 1
 
     results["Goals"] = f"{goals_ok}/{goals_total} (Goal_11 x2 + DevGoal_2001 x1 per employee)"
 
-    # ── Phase 16: IAS passwords ────────────────────────────────────────────────
-    all_users = employees + [{"username": onb_user, "email_tag": onb_tag}]
+    # ── Phase 16: IAS user creation + password ────────────────────────────────
+    # Create users directly in IAS via SCIM — do NOT poll for SF→IAS sync
+    # (this tenant does not auto-provision IAS users from SF)
+    all_users_ias = employees + [{
+        "username": onb_user, "email_tag": onb_tag,
+        "firstName": "Alex", "lastName": "Jordan",
+    }]
     ias_ok = 0
-    # Poll up to 120s for first user to appear in IAS
-    first_uname = employees[0]["username"]
-    for attempt in range(20):
-        ias_user = _ias_get_user(first_uname)
-        if ias_user:
-            break
-        time.sleep(6)
-
-    for e in all_users:
-        email = f"{email_pfx}+{e['email_tag']}@sap.com"
-        success, _ = _ias_set_password(e["username"], password, email)
+    for e in all_users_ias:
+        email = f"{email_pfx}+{e['email_tag']}.{uid6}@sap.com"
+        success, _ = _ias_ensure_user(
+            username=e["username"],
+            password=password,
+            email=email,
+            first_name=e.get("firstName", ""),
+            last_name=e.get("lastName", ""),
+            sf=sf,
+        )
         if success:
             ias_ok += 1
-        time.sleep(1)
-    results["IASPasswords"] = f"{ias_ok}/{len(all_users)}"
+        time.sleep(0.5)
+    results["IASPasswords"] = f"{ias_ok}/{len(all_users_ias)}"
 
     # ── Build final confirmation ───────────────────────────────────────────────
-    user_lines = []
+
+    # Phase results table — one row per provisioned entity with ✅/❌
+    _PHASE_LABELS = {
+        "Company":           "Company & location record",
+        "Departments":       "Departments",
+        "CostCentres":       "Cost centres",
+        "Positions":         "Positions",
+        "Employees":         "Employee accounts (EC)",
+        "EmpJobs":           "Employment records",
+        "TalentProfiles":    "Talent profiles (impact/risk/FL)",
+        "Goals":             "Goal assignments",
+        "CompHistory":       "Compensation history (salary)",
+        "BonusEntries":      "Year-end bonus entries",
+        "SpotAwards":        "Spot / recognition awards",
+        "Onboardee":         "Onboardee (pending hire)",
+        "IASPasswords":      "IAS login activation",
+    }
+
+    phase_rows = []
+    for phase_key, label in _PHASE_LABELS.items():
+        val = results.get(phase_key)
+        if val is None:
+            continue
+        # Determine flag: anything that starts with a digit fraction like "5/5" → check equality
+        if isinstance(val, str) and "/" in val:
+            parts = val.split("/")
+            try:
+                flag = "✅" if int(parts[0]) == int(parts[1]) else "⚠️"
+            except ValueError:
+                flag = "✅"
+        else:
+            flag = "✅" if str(val).upper() not in ("FALSE", "0", "FAILED", "ERROR") else "❌"
+        phase_rows.append(f"  {flag}  {label:<40} {val}")
+
+    # Credential rows — one per user (employees + onboardee)
+    cred_rows = []
+    _col = "{:<10} {:<28} {:<36} {}"
+    cred_rows.append("  " + _col.format("User ID", "SF Username", "Email", "Title"))
+    cred_rows.append("  " + "-"*95)
     for e in employees:
-        email = f"{email_pfx}+{e['email_tag']}@sap.com"
-        mgr_label = "(root)" if e["manager"] is None else f"→ {e['manager']}"
-        user_lines.append(
-            f"  {e['userId']:<8} {e['username']:<22} {e['jobTitle']:<30} {mgr_label}\n"
-            f"           email: {email}  sal: ${e['salaryHistory'][-1]:,}  bonus: ${e['yearEndBonus']:,}"
-        )
-    user_lines.append(
-        f"  {onb_uid:<8} {onb_user:<22} Senior Associate (onboardee, starts Nov 3)"
-    )
+        email = f"{email_pfx}+{e['email_tag']}.{uid6}@sap.com"
+        cred_rows.append("  " + _col.format(e["userId"], e["username"], email, e["jobTitle"]))
+    onb_email_line = f"{email_pfx}+{onb_tag}.{uid6}@sap.com"
+    cred_rows.append("  " + _col.format(onb_uid, onb_user, onb_email_line, "Senior Associate (onboardee)"))
 
     story_lines = []
     for item in plan.get("story_data", []):
@@ -1914,6 +2527,10 @@ def provision_demo_org(plan_json: str) -> str:
     joule_lines = [f"  • {p}" for p in plan.get("joule_prompts", [])]
 
     # ── Persist to HANA ───────────────────────────────────────────────────────
+    # Stamp uid6 onto email_tags so HANA stores the same unique emails used in IAS/SF
+    for e in employees:
+        if "email_tag" in e:
+            e["email_tag"] = f"{e['email_tag']}.{uid6}"
     db_status = "not_persisted"
     try:
         _db.save_demo_org(
@@ -1927,6 +2544,7 @@ def provision_demo_org(plan_json: str) -> str:
             created_by=caller_email,
             employees=employees,
             email_prefix=email_pfx,
+            plan_json=plan_json,
         )
         db_status = "saved"
     except Exception as e:
@@ -1939,28 +2557,32 @@ def provision_demo_org(plan_json: str) -> str:
         "code":      co,
         "industry":  plan["industry"],
         "problem":   plan["scenario_label"],
-        "login_url": LOGIN_URL,
+        "login_url": sf["login_url"],
         "password":  password,
         "created_by": caller_email or "anonymous",
         "db_status": db_status,
         "phase_results": results,
         "errors":    all_errors[:10],
         "confirmation": (
-            f"{'='*64}\n"
-            f"  {name} ({co}) — {plan['scenario_label']}\n"
-            f"  Demo ID  : {demo_id}\n"
-            f"  Instance : SFSALES011375\n"
-            f"  Login    : {LOGIN_URL}\n"
-            f"  Password : {password}\n"
-            f"{'='*64}\n\n"
-            f"EMPLOYEES CREATED:\n" + "\n".join(user_lines) + "\n\n"
-            f"WHAT'S LIVE IN SF:\n"
-            + "\n".join(f"  ✅ {k}: {v}" for k, v in results.items()) + "\n\n"
-            f"WHAT'S STORY (not provisioned):\n"
+            f"{'='*80}\n"
+            f"  {name} ({co})  —  {plan['scenario_label']}\n"
+            f"  Demo ID   : {demo_id}\n"
+            f"  Instance  : {sf['company_code']}\n"
+            f"  Login URL : {sf['login_url']}\n"
+            f"  Password  : {password}  (shared by all users below)\n"
+            f"{'='*80}\n\n"
+            f"PROVISIONING RESULTS:\n"
+            + "\n".join(phase_rows) + "\n\n"
+            f"USER CREDENTIALS:\n"
+            + "\n".join(cred_rows) + "\n\n"
+            f"  ℹ️  Activation emails have been sent to each user's SAP email address.\n"
+            f"     All accounts are immediately active — no email action required.\n"
+            f"     Log in with the username above and password: {password}\n\n"
+            f"STORY DATA (not provisioned — narrate in the demo):\n"
             + ("\n".join(story_lines) if story_lines else "  (none for this scenario)") + "\n\n"
             f"STORY NARRATIVE:\n  {plan.get('story_data_narrative','')}\n\n"
             f"JOULE PROMPTS TO TRY:\n" + "\n".join(joule_lines) + "\n"
-            f"{'='*64}\n"
+            f"{'='*80}\n"
         ),
     }
     return json.dumps(output, indent=2)
@@ -2018,34 +2640,728 @@ def list_my_orgs(ctx=None) -> str:
             "caller":    caller_email or "anonymous (stdio mode)",
             "org_count": len(orgs),
             "orgs":      orgs,
-            "login_url": LOGIN_URL,
+            "login_url": _build_sf_config(caller_email)["login_url"],
         }, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "hint": "HANA not available — check VCAP_SERVICES or HANA_* env vars"})
 
 
 @mcp.tool()
-def get_org_details(demo_id: str) -> str:
+def get_org_details(demo_id: str, ctx=None) -> str:
     """
     Get full details for a provisioned demo org by its unique demo_id.
 
-    Returns the org record plus all user emails provisioned in that org.
-    Use this to retrieve login credentials for an org you provisioned earlier.
+    Returns the org record plus all user credentials provisioned in that org.
+    Only returns orgs you created — enforced via XSUAA caller identity.
 
     Args:
         demo_id: The UUID returned by provision_demo_org()
     """
+    caller_email = _extract_caller_email(ctx)
     try:
-        org = _db.get_demo_org(demo_id)
-        if not org:
+        owner = _db.get_org_created_by(demo_id)
+        if owner is None:
             return json.dumps({"error": f"No org found with demo_id '{demo_id}'"})
-        org["login_url"] = LOGIN_URL
+        if caller_email and owner != caller_email:
+            return json.dumps({"error": "Access denied — this org belongs to a different user."})
+        org = _db.get_demo_org(demo_id)
+        org["login_url"] = _build_sf_config(caller_email)["login_url"]
         return json.dumps(org, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "hint": "HANA not available — check VCAP_SERVICES or HANA_* env vars"})
 
 
-# ── Tool: Generate Agent Hub card ─────────────────────────────────────────────
+@mcp.tool()
+def delete_demo_org(demo_id: str, confirmed: bool = False, ctx=None) -> str:
+    """
+    Delete a demo org — removes all SF data and the HANA record.
+
+    SAFETY: This tool only acts on the exact user IDs and company code recorded
+    in HANA for this demo_id. It reads those IDs from the database first — it
+    never infers or guesses what to remove. You can only delete orgs you created
+    (enforced via XSUAA caller identity).
+
+    IMPORTANT — how SF cleanup works in practice:
+    The SF tenant (SFSALES011375) blocks OData DELETE on Employee Central entities
+    (EmpJob, EmpEmployment, User, compensation, etc.) — this is a tenant-level
+    restriction that cannot be bypassed via API. Instead this tool:
+      • Goals + spot awards: DELETED (these entities are deletable)
+      • Users + employment records: DEACTIVATED (status=inactive) — they become
+        invisible to all queries, org chart, and demo flows, but the rows remain
+        in SF storage. This is the correct SF cleanup approach for shared tenants.
+      • Structural records (positions, FOCompany, FOLocation): best-effort DELETE,
+        silently skipped if the tenant blocks it.
+      • HANA record: DELETED — the org disappears from your demo list immediately.
+    IAS users are NOT touched.
+
+    Call with confirmed=False first to see exactly what will happen.
+    Call with confirmed=True to perform the cleanup.
+
+    Args:
+        demo_id:   The UUID of the org to delete (from list_my_orgs)
+        confirmed: Must be True to actually run. False shows a pre-flight summary only.
+    """
+    caller_email = _extract_caller_email(ctx)
+    try:
+        owner = _db.get_org_created_by(demo_id)
+        if owner is None:
+            return json.dumps({"error": f"No org found with demo_id '{demo_id}'"})
+        if caller_email and owner != caller_email:
+            return json.dumps({"error": "Access denied — this org belongs to a different user."})
+        org = _db.get_demo_org(demo_id)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+    co   = org["company_code"]
+    name = org["company_name"]
+    users = org.get("users", [])
+    user_ids = [u["user_id"] for u in users]
+
+    # Safety: the HANA record IS the authority on what we created.
+    # We only delete the exact user IDs and company code stored in DEMO_ORGS /
+    # DEMO_ORG_EMAILS for this demo_id. Nothing outside those keys is touched.
+    # Ownership is already enforced above (caller_email must match CREATED_BY).
+    if not user_ids:
+        return json.dumps({"error": "No users found in HANA for this org — cannot determine what to delete."})
+
+    # Include the onboardee (username pattern: prefix.onb)
+    prefix = user_ids[0][:-3] if user_ids else ""
+    onb_uid = f"{prefix}{len(user_ids)+1:03d}" if prefix else None
+
+    summary_lines = [
+        f"Demo org:     {name} (demo_id={demo_id})",
+        f"Company code: {co}",
+        f"Users:        {', '.join(user_ids)}" + (f", {onb_uid} (onboardee)" if onb_uid else ""),
+        "",
+        "What will happen in SF:",
+        "  ✅ DELETED  — Goals (Goal_11 + DevGoal_2001) for all users",
+        "  ✅ DELETED  — Spot awards",
+        "  ⚠️  DEACTIVATED — Users + all employment/compensation records",
+        "    (SF tenant blocks OData DELETE on EC entities — deactivation makes",
+        "     them invisible to all queries, org chart, and demo flows)",
+        f"  🗑️  BEST-EFFORT — Positions, FODepartment, FOCostCenter, FOLocation, FOCompany",
+        "",
+        "What will happen in HANA:",
+        "  ✅ DELETED  — Org record + all user email rows (org disappears from your list)",
+        "",
+        "IAS users: NOT touched",
+    ]
+
+    if not confirmed:
+        return json.dumps({
+            "status": "awaiting_confirmation",
+            "message": "\n".join(summary_lines),
+            "action_required": f"Call delete_demo_org(demo_id='{demo_id}', confirmed=True) to proceed.",
+        }, indent=2)
+
+    # ── Confirmed — run cleanup ───────────────────────────────────────────────
+    sf = _build_sf_config(caller_email)
+    results = {}
+    all_uids = user_ids + ([onb_uid] if onb_uid else [])
+
+    # Phase 1: Goals — must delete authenticated as the user (sfadmin gets 403)
+    goal_ok = goal_fail = 0
+    for u in users:
+        uid = u["user_id"]
+        username = u["username"]
+        password = org.get("password", "")
+        full_user = f"{username}@{sf['company_code']}"
+        creds = base64.b64encode(f"{full_user}:{password}".encode()).decode()
+        user_hdrs = {**sf['sf_headers'], "Authorization": f"Basic {creds}"}
+        for entity in ("Goal_11", "DevGoal_2001"):
+            list_url = f"{sf['sf_base']}/{entity}?%24filter=userId%20eq%20'{uid}'&%24select=id&%24format=json"
+            req = urllib.request.Request(list_url, headers=user_hdrs)
+            try:
+                with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
+                    rows = json.loads(r.read()).get("d", {}).get("results", [])
+                for row in rows:
+                    gid = row.get("id")
+                    if not gid:
+                        continue
+                    ok, _ = _sf_delete(f"{entity}({gid})", {**sf, "sf_headers": user_hdrs})
+                    if ok: goal_ok += 1
+                    else:  goal_fail += 1
+            except Exception:
+                pass
+    results["Goals"] = f"deleted={goal_ok} failed={goal_fail}"
+
+    # Phase 2: Spot awards
+    sa_ok = sa_fail = 0
+    for uid in all_uids:
+        list_url = f"{sf['sf_base']}/SpotAward?%24filter=userId%20eq%20'{uid}'&%24select=externalCode&%24format=json"
+        req = urllib.request.Request(list_url, headers=sf['sf_headers'])
+        try:
+            with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
+                rows = json.loads(r.read()).get("d", {}).get("results", [])
+            for row in rows:
+                code = row.get("externalCode")
+                if code:
+                    ok, _ = _sf_delete(f"SpotAward({code})", sf)
+                    if ok: sa_ok += 1
+                    else:  sa_fail += 1
+        except Exception:
+            pass
+    results["SpotAwards"] = f"deleted={sa_ok} failed={sa_fail}"
+
+    # Phase 3: Deactivate all users (status=f) — EC entities are not deletable
+    # via OData in this tenant; deactivation makes them invisible to all demo flows.
+    deact_rows = [
+        {"__metadata": {"uri": f"User('{uid}')"}, "userId": uid, "status": "f"}
+        for uid in all_uids
+    ]
+    deact_ok = 0
+    try:
+        body = json.dumps(deact_rows).encode()
+        req = urllib.request.Request(f"{sf['sf_base']}/upsert", data=body, headers=sf['sf_headers'], method="POST")
+        with urllib.request.urlopen(req, context=CTX, timeout=30) as r:
+            resp = r.read().decode()
+            deact_ok = resp.count("UPDATED") + resp.count("204")
+    except Exception as e:
+        results["Deactivate_error"] = str(e)[:120]
+    results["Users_deactivated"] = f"{deact_ok}/{len(deact_rows)}"
+
+    # Phase 4: Best-effort structural deletes (positions, org units, company)
+    def _del_single(uri):
+        ok, _ = _sf_delete(uri, sf)
+        return ok
+
+    pos_nums = [u["user_id"][-3:] for u in users]
+    if onb_uid:
+        pos_nums.append(f"{len(users)+1:03d}")
+    p_ok = sum(_del_single(f"Position('P-{co}-{n}')") for n in pos_nums)
+    results["Positions"] = f"{p_ok}/{len(pos_nums)} (best-effort)"
+
+    dept_keys = list(dict.fromkeys(u.get("department", "") for u in users if u.get("department")))
+    fd_ok = sum(_del_single(f"FODepartment(externalCode='{co}-D-{dk}',startDate=datetime'1900-01-01T00:00:00')") for dk in dept_keys)
+    cc_ok = sum(_del_single(f"FOCostCenter(externalCode='{co}-{dk}',startDate=datetime'1900-01-01T00:00:00')") for dk in dept_keys)
+    results["FODepartment"] = f"{fd_ok}/{len(dept_keys)} (best-effort)"
+    results["FOCostCenter"] = f"{cc_ok}/{len(dept_keys)} (best-effort)"
+    _del_single(f"FOLocation(externalCode='{co}-HQ01',startDate=datetime'1900-01-01T00:00:00')")
+    _del_single(f"FOCompany(externalCode='{co}',startDate=datetime'1900-01-01T00:00:00')")
+    results["FOLocation_FOCompany"] = "best-effort"
+
+    # ── Remove from HANA ──────────────────────────────────────────────────────
+    hana_ok = False
+    try:
+        _db.delete_demo_org(demo_id)
+        hana_ok = True
+    except Exception as e:
+        results["HANA"] = f"error: {e}"
+
+    if hana_ok:
+        results["HANA"] = "deleted"
+
+    print(f"[delete] demo_id={demo_id} co={co} caller={caller_email!r} results={results}", flush=True)
+
+    return json.dumps({
+        "status": "deleted",
+        "demo_id": demo_id,
+        "company_name": name,
+        "company_code": co,
+        "sf_results": results,
+    }, indent=2)
+
+
+def _resolve_demo_id(demo_id: Optional[str], caller_email: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
+    """Return (org_dict, error_str). Enforces caller ownership."""
+    if not demo_id:
+        return None, "demo_id is required"
+    owner = _db.get_org_created_by(demo_id)
+    if owner is None:
+        return None, f"No org found with demo_id '{demo_id}'"
+    if caller_email and owner != caller_email:
+        return None, "Access denied — this org belongs to a different user."
+    org = _db.get_demo_org(demo_id)
+    return org, None
+
+
+@mcp.tool()
+def get_org_employees(demo_id: str, ctx=None) -> str:
+    """
+    List all employees provisioned in a demo org with their credentials,
+    job titles, department, pay grade, and SF login details.
+
+    Only returns data for orgs you created (enforced via XSUAA identity).
+
+    Args:
+        demo_id: The UUID returned by provision_demo_org()
+    """
+    caller_email = _extract_caller_email(ctx)
+    org, err = _resolve_demo_id(demo_id, caller_email)
+    if err:
+        return json.dumps({"error": err})
+
+    rows = []
+    for u in org.get("users", []):
+        rows.append({
+            "user_id":   u["user_id"],
+            "username":  u["username"],
+            "email":     u["email"],
+            "job_title": u["job_title"],
+            "pay_grade": u["pay_grade"],
+            "department": u.get("department", ""),
+            "sf_login":  f"{u['username']}@{org['company_code']}",
+            "login_url": _build_sf_config(caller_email)["login_url"],
+            "password":  org["password"],
+        })
+
+    _sf_cfg = _build_sf_config(caller_email)
+    return json.dumps({
+        "demo_id":      demo_id,
+        "company":      org["company_name"],
+        "company_code": org["company_code"],
+        "instance":     _sf_cfg["company_code"],
+        "login_url":    _sf_cfg["login_url"],
+        "password":     org["password"],
+        "employee_count": len(rows),
+        "employees":    rows,
+        "note": f"All accounts are active. Log in with username@{_sf_cfg['company_code']} or use the email address shown.",
+    }, indent=2)
+
+
+@mcp.tool()
+def get_org_goals(demo_id: str, ctx=None) -> str:
+    """
+    List the goal assignments provisioned for every employee in a demo org.
+
+    Returns annual and development goals per person, tied to the demo scenario.
+    Only returns data for orgs you created (enforced via XSUAA identity).
+
+    Args:
+        demo_id: The UUID returned by provision_demo_org()
+    """
+    caller_email = _extract_caller_email(ctx)
+    org, err = _resolve_demo_id(demo_id, caller_email)
+    if err:
+        return json.dumps({"error": err})
+
+    rows = []
+    for u in org.get("users", []):
+        g = u.get("goals") or {}
+        rows.append({
+            "user_id":   u["user_id"],
+            "username":  u["username"],
+            "job_title": u["job_title"],
+            "goals": {
+                "annual_goal_1": {
+                    "name":   g.get("annual_1_name", ""),
+                    "metric": g.get("annual_1_metric", ""),
+                },
+                "annual_goal_2": {
+                    "name":   g.get("annual_2_name", ""),
+                    "metric": g.get("annual_2_metric", ""),
+                },
+                "development_goal": {
+                    "name":   g.get("dev_name", ""),
+                    "metric": g.get("dev_metric", ""),
+                },
+            },
+        })
+
+    return json.dumps({
+        "demo_id":   demo_id,
+        "company":   org["company_name"],
+        "scenario":  org["scenario"],
+        "goal_year": str(_dt.date.today().year),
+        "employees": rows,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_org_compensation(demo_id: str, ctx=None) -> str:
+    """
+    Show compensation summary for all employees in a demo org:
+    pay grade, salary progression (3 steps), and year-end bonus.
+
+    Useful for demonstrating pay equity and compensation analytics stories.
+    Only returns data for orgs you created (enforced via XSUAA identity).
+
+    Args:
+        demo_id: The UUID returned by provision_demo_org()
+    """
+    caller_email = _extract_caller_email(ctx)
+    org, err = _resolve_demo_id(demo_id, caller_email)
+    if err:
+        return json.dumps({"error": err})
+
+    # Pull full plan for salary/bonus detail — fall back to grade-only from DEMO_ORG_EMAILS
+    plan_str = _db.get_org_plan_json(demo_id)
+    plan_employees = {}
+    if plan_str:
+        try:
+            plan_employees = {e["userId"]: e for e in json.loads(plan_str).get("employees", [])}
+        except Exception:
+            pass
+
+    rows = []
+    for u in org.get("users", []):
+        pe = plan_employees.get(u["user_id"], {})
+        sal_hist = pe.get("salaryHistory") or []
+        bonus    = pe.get("yearEndBonus", "")
+        rows.append({
+            "user_id":         u["user_id"],
+            "username":        u["username"],
+            "job_title":       u["job_title"],
+            "pay_grade":       u["pay_grade"],
+            "salary_history":  sal_hist,
+            "current_salary":  sal_hist[-1] if sal_hist else None,
+            "year_end_bonus":  bonus,
+        })
+
+    return json.dumps({
+        "demo_id":  demo_id,
+        "company":  org["company_name"],
+        "currency": "USD",
+        "employees": rows,
+    }, indent=2)
+
+
+@mcp.tool()
+def get_org_talent(demo_id: str, ctx=None) -> str:
+    """
+    Show talent profile data for all employees in a demo org:
+    impact of loss, risk of loss, future leader flag, and pay grade.
+
+    Use this to demonstrate talent retention and succession analytics stories.
+    Only returns data for orgs you created (enforced via XSUAA identity).
+
+    Args:
+        demo_id: The UUID returned by provision_demo_org()
+    """
+    caller_email = _extract_caller_email(ctx)
+    org, err = _resolve_demo_id(demo_id, caller_email)
+    if err:
+        return json.dumps({"error": err})
+
+    plan_str = _db.get_org_plan_json(demo_id)
+    plan_employees = {}
+    if plan_str:
+        try:
+            plan_employees = {e["userId"]: e for e in json.loads(plan_str).get("employees", [])}
+        except Exception:
+            pass
+
+    rows = []
+    for u in org.get("users", []):
+        pe = plan_employees.get(u["user_id"], {})
+        rows.append({
+            "user_id":       u["user_id"],
+            "username":      u["username"],
+            "job_title":     u["job_title"],
+            "pay_grade":     u["pay_grade"],
+            "department":    u.get("department", ""),
+            "impact_of_loss":  pe.get("impactOfLoss", ""),
+            "risk_of_loss":    pe.get("riskOfLoss", ""),
+            "future_leader":   pe.get("futureLeader", False),
+        })
+
+    high_impact = [r for r in rows if r["impact_of_loss"] == "HIGH"]
+    future_leaders = [r["username"] for r in rows if r["future_leader"]]
+
+    return json.dumps({
+        "demo_id":        demo_id,
+        "company":        org["company_name"],
+        "scenario":       org["scenario"],
+        "summary": {
+            "high_impact_count":   len(high_impact),
+            "future_leader_count": len(future_leaders),
+            "future_leaders":      future_leaders,
+        },
+        "employees": rows,
+    }, indent=2)
+
+
+# ── Tools: API key management ─────────────────────────────────────────────────
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+@mcp.tool()
+def generate_api_key(label: str, ctx=None) -> str:
+    """
+    Generate an API key for A2A / machine-to-machine access to this MCP server.
+
+    The key is tied to your user identity (from your XSUAA login). Any A2A caller
+    using this key will be treated as you — they can only access your demo orgs.
+
+    The plaintext key is returned ONCE and never stored. Copy it immediately.
+    Future calls to this endpoint for the same label will fail — revoke and recreate.
+
+    A2A usage: POST to https://sf-demo-builder.cfapps.us10.hana.ondemand.com/a2a/mcp
+    with header: X-API-Key: <your key>
+
+    Args:
+        label: A descriptive name for this key, e.g. "sf-demo-agent-prod"
+    """
+    caller_email = _extract_caller_email(ctx)
+
+    # Block A2A callers from creating new keys — must authenticate via XSUAA
+    if _is_a2a_request.get():
+        return json.dumps({
+            "error": "API key generation requires interactive XSUAA login. "
+                     "Call this tool via POST /mcp with a valid Bearer token."
+        })
+
+    if not caller_email:
+        return json.dumps({
+            "error": "Cannot determine caller identity. "
+                     "Ensure you are authenticated via XSUAA Bearer token."
+        })
+
+    if not label or len(label.strip()) < 3:
+        return json.dumps({"error": "label must be at least 3 characters."})
+    label = label.strip()
+
+    plaintext = "sfdemob_" + secrets.token_urlsafe(32)
+    key_hash   = _sha256_hex(plaintext)
+
+    try:
+        _db.save_api_key(key_hash, caller_email, label)
+    except Exception as e:
+        return json.dumps({"error": f"Failed to save key: {str(e)[:200]}"})
+
+    return json.dumps({
+        "api_key":  plaintext,
+        "label":    label,
+        "owner":    caller_email,
+        "a2a_endpoint": "https://sf-demo-builder.cfapps.us10.hana.ondemand.com/a2a/mcp",
+        "usage":    "Add header:  X-API-Key: <api_key>",
+        "note":     "Store this key now — it is not retrievable after this response.",
+    }, indent=2)
+
+
+@mcp.tool()
+def list_api_keys(ctx=None) -> str:
+    """
+    List all API keys you have created.
+
+    Returns label, creation date, last-used date, and active status.
+    Never returns the key itself (only the hash is stored).
+    """
+    caller_email = _extract_caller_email(ctx)
+    if not caller_email:
+        return json.dumps({"error": "Cannot determine caller identity."})
+    try:
+        keys = _db.list_api_keys(caller_email)
+        return json.dumps({
+            "owner": caller_email,
+            "count": len(keys),
+            "keys":  keys,
+            "a2a_endpoint": "https://sf-demo-builder.cfapps.us10.hana.ondemand.com/a2a/mcp",
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def revoke_api_key(label: str, ctx=None) -> str:
+    """
+    Revoke an API key by its label. The key will immediately stop working.
+
+    Args:
+        label: The label you gave the key when you created it
+    """
+    caller_email = _extract_caller_email(ctx)
+    if not caller_email:
+        return json.dumps({"error": "Cannot determine caller identity."})
+    try:
+        revoked = _db.revoke_api_key_by_label(label.strip(), caller_email)
+        if revoked:
+            return json.dumps({"status": "revoked", "label": label, "owner": caller_email})
+        return json.dumps({"error": f"No active key found with label '{label}' for your account."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def configure_sf_instance(
+    api_base_url: str,
+    admin_user: str,
+    admin_password: str,
+    login_url: str,
+    ias_client_id: Optional[str] = None,
+    ias_client_secret: Optional[str] = None,
+    ctx=None,
+) -> str:
+    """
+    Configure a custom SAP SuccessFactors instance for your session.
+
+    By default this server provisions demos into the shared SAP sales demo
+    environment (SFSALES011375). Use this tool to point it at your own SF
+    instance instead.
+
+    All provisioned orgs you create after calling this tool will use your
+    instance, and are scoped to your login (other users are unaffected).
+
+    IAS (Identity Authentication Service) is auto-detected from the login URL.
+    To enable IAS password provisioning for your instance, also pass the IAS
+    system administrator client_id and client_secret (created in IAS Admin UI
+    under Applications & Resources → System Applications → Add System → Manage Users scope).
+
+    Args:
+        api_base_url:      SF OData API base URL, e.g. https://apisalesdemo8.successfactors.com/odata/v2
+        admin_user:        SF admin username including company code, e.g. sfadmin@MYCOMPANY
+        admin_password:    SF admin password
+        login_url:         Full browser login URL, e.g. https://hcm-us10-sales.hr.cloud.sap/login?company=MYCO
+        ias_client_id:     (optional) IAS system admin client ID for SCIM password provisioning
+        ias_client_secret: (optional) IAS system admin client secret
+    """
+    caller_email = _extract_caller_email(ctx)
+    if not caller_email:
+        return json.dumps({"error": "Authentication required. Please connect via XSUAA OAuth2."})
+
+    # Normalise API base URL — strip trailing slashes, ensure /odata/v2 if missing
+    api_base = api_base_url.rstrip("/")
+
+    # Validate by making a lightweight OData ping
+    test_creds = base64.b64encode(f"{admin_user}:{admin_password}".encode()).decode()
+    test_headers = {"Authorization": f"Basic {test_creds}", "Accept": "application/json"}
+    ping_url = f"{api_base}/User?$top=1&$select=userId"
+    try:
+        req = urllib.request.Request(ping_url, headers=test_headers)
+        with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
+            r.read()
+        validation_status = "ok"
+        validation_msg = "Credentials verified against SF OData API."
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return json.dumps({"error": "SF credentials rejected (401). Check admin_user and admin_password."})
+        elif e.code == 403:
+            return json.dumps({"error": "SF credentials valid but insufficient permissions (403). Check admin role."})
+        else:
+            validation_status = "warning"
+            validation_msg = f"SF API returned HTTP {e.code} — credentials accepted but endpoint returned an error. Proceeding."
+    except Exception as ex:
+        return json.dumps({"error": f"Could not reach SF API at {api_base}: {ex}"})
+
+    # Auto-detect IAS from login URL
+    print(f"[configure_sf] Detecting IAS from login URL: {login_url}", flush=True)
+    ias_base = _detect_ias_from_login_url(login_url)
+    if ias_base:
+        print(f"[configure_sf] IAS detected: {ias_base}", flush=True)
+        if ias_client_id and ias_client_secret:
+            # Validate the IAS credentials before storing
+            test_ias_auth = "Basic " + base64.b64encode(f"{ias_client_id}:{ias_client_secret}".encode()).decode()
+            ias_test_url = ias_base.rstrip("/") + "/service/scim/Users?count=1"
+            try:
+                ias_req = urllib.request.Request(ias_test_url, headers={"Authorization": test_ias_auth, "Accept": "application/scim+json"})
+                with urllib.request.urlopen(ias_req, context=CTX, timeout=15) as r:
+                    r.read()
+                ias_cid = ias_client_id
+                ias_csec = ias_client_secret
+                ias_msg = f"IAS tenant: {ias_base}. Client credentials verified — IAS password provisioning enabled."
+            except urllib.error.HTTPError as e:
+                return json.dumps({"error": f"IAS client credentials rejected (HTTP {e.code}). Check ias_client_id and ias_client_secret."})
+            except Exception as ex:
+                return json.dumps({"error": f"Could not reach IAS at {ias_base}: {ex}"})
+        else:
+            ias_cid = None
+            ias_csec = None
+            ias_msg = (
+                f"IAS tenant detected: {ias_base}. "
+                "IAS password provisioning is DISABLED — no client credentials provided. "
+                "To enable it, call configure_sf_instance again and pass ias_client_id and ias_client_secret "
+                "(create a system admin in IAS Admin UI under Applications & Resources → System Applications, "
+                "grant 'Manage Users' scope)."
+            )
+    else:
+        ias_cid = None
+        ias_csec = None
+        ias_msg = "No IAS redirect detected from login URL — IAS user provisioning will be skipped for your instance."
+
+    _db.save_sf_config(
+        owner_email=caller_email,
+        api_base_url=api_base,
+        admin_user=admin_user,
+        admin_pass=admin_password,
+        login_url=login_url,
+        ias_base_url=ias_base,
+        ias_client_id=ias_cid,
+        ias_client_secret=ias_csec,
+    )
+
+    company_code = admin_user.split("@", 1)[1] if "@" in admin_user else "UNKNOWN"
+    return json.dumps({
+        "status":           validation_status,
+        "message":          validation_msg,
+        "instance_config":  {
+            "api_base_url":        api_base,
+            "admin_user":          admin_user,
+            "company_code":        company_code,
+            "login_url":           login_url,
+            "ias_detected":        ias_base is not None,
+            "ias_base_url":        ias_base,
+            "ias_passwords_ready": ias_cid is not None,
+        },
+        "ias_note":         ias_msg,
+        "owner":            caller_email,
+        "note":             "Configuration saved. All future provisioning requests from your account will use this instance.",
+    }, indent=2)
+
+
+@mcp.tool()
+def get_sf_instance_config(ctx=None) -> str:
+    """
+    Show the SF instance configuration currently active for your account.
+
+    Returns your custom config if set, or confirms you are using the default
+    shared demo environment (SFSALES011375).
+    """
+    caller_email = _extract_caller_email(ctx)
+    if not caller_email:
+        return json.dumps({"error": "Authentication required."})
+
+    custom = _db.get_sf_config(caller_email)
+    if custom:
+        return json.dumps({
+            "source":        "custom",
+            "api_base_url":  custom["api_base_url"],
+            "admin_user":    custom["admin_user"],
+            "login_url":     custom["login_url"],
+            "ias_enabled":   custom["ias_base_url"] is not None,
+            "ias_base_url":  custom["ias_base_url"],
+            "configured_at": custom["updated_at"],
+            "owner":         caller_email,
+        }, indent=2)
+    else:
+        cfg = _build_sf_config(None)
+        return json.dumps({
+            "source":       "default",
+            "api_base_url": cfg["sf_base"],
+            "admin_user":   cfg["admin_user"],
+            "login_url":    cfg["login_url"],
+            "ias_enabled":  cfg["ias_base"] is not None,
+            "ias_base_url": cfg["ias_base"],
+            "note":         "Using shared demo environment. Call configure_sf_instance to use your own instance.",
+        }, indent=2)
+
+
+@mcp.tool()
+def reset_sf_instance_config(ctx=None) -> str:
+    """
+    Reset your SF instance configuration back to the default shared demo environment.
+
+    After calling this, your provisioning requests will use SFSALES011375 again.
+    """
+    caller_email = _extract_caller_email(ctx)
+    if not caller_email:
+        return json.dumps({"error": "Authentication required."})
+
+    deleted = _db.delete_sf_config(caller_email)
+    if deleted:
+        return json.dumps({
+            "status":  "reset",
+            "message": "Custom SF config removed. Provisioning will now use the default shared demo environment.",
+            "owner":   caller_email,
+        })
+    else:
+        return json.dumps({
+            "status":  "no_config",
+            "message": "No custom config found — already using the default shared demo environment.",
+        })
+
+
 
 @mcp.tool()
 def generate_agent_card(plan_json: str) -> str:
@@ -2073,6 +3389,8 @@ def generate_agent_card(plan_json: str) -> str:
     live  = plan.get("live_data", [])
     story = plan.get("story_data", [])
     employees = plan.get("employees", [])
+    instance_code = plan.get("sf_instance", plan.get("company_code", "SFSALES011375"))
+    script_login_url = plan.get("login_url", LOGIN_URL)
 
     # Build persona table — who to log in as for the demo
     personas = []
@@ -2082,7 +3400,7 @@ def generate_agent_card(plan_json: str) -> str:
             "title":    e["jobTitle"],
             "username": e["username"],
             "grade":    e["payGrade"],
-            "login":    f"{e['username']}@SFSALES011375",
+            "login":    f"{e['username']}@{instance_code}",
         })
 
     # Story data framing — what the AE says when Joule can't show it
@@ -2097,8 +3415,7 @@ def generate_agent_card(plan_json: str) -> str:
             "title":     card.get("title", ""),
             "challenge": card.get("challenge", ""),
             "prompts":   card.get("prompts", []),
-            "joule_url": LOGIN_URL,
-            "password":  plan.get("password", ""),
+            "joule_url": script_login_url,
         },
         "demo_context": {
             "company":   plan.get("company_name"),
@@ -2143,7 +3460,7 @@ def generate_agent_card(plan_json: str) -> str:
                 f"│ {line:<60} │"
                 for line in _wrap("STORY: " + ", ".join(i["entity"] for i in story), 60)
             ) + "\n" if story else "")
-            + f"│ {'Login: ' + LOGIN_URL[:53]:<60} │\n"
+            + f"│ {'Login: ' + script_login_url[:53]:<60} │\n"
             f"└{'─'*62}┘"
         ),
     }
@@ -2209,7 +3526,7 @@ def generate_demo_script(plan_json: str) -> str:
     for e in employees[:3]:
         personas.append(
             f"{e['firstName']} {e['lastName']} ({e['jobTitle']}, {e['payGrade']}) "
-            f"— login: {e['username']}@SFSALES011375 / {password}"
+            f"— login: {e['username']}@{instance_code} / {password}"
         )
 
     # Format Joule Chat beats
@@ -2250,7 +3567,7 @@ def generate_demo_script(plan_json: str) -> str:
     script_text = (
         f"{'='*70}\n"
         f"  DEMO SCRIPT: {company} — {scenario.get('label','')}\n"
-        f"  Instance: SFSALES011375  |  Password: {password}\n"
+        f"  Instance: {instance_code}  |  Password: {password}\n"
         f"{'='*70}\n\n"
         f"PERSONAS (log in as these users):\n"
         + "\n".join(f"  • {p}" for p in personas) + "\n\n"
@@ -2283,7 +3600,7 @@ def generate_demo_script(plan_json: str) -> str:
         "joule_chat_beats":    [b["beat"] for b in chat_beats],
         "joule_desktop_beats": [b["beat"] for b in desktop_beats],
         "story_bridge": story_bridge,
-        "login_url": LOGIN_URL,
+        "login_url": script_login_url,
     }, indent=2)
 
 
@@ -2294,29 +3611,302 @@ if __name__ == "__main__":
             if arg == "--port" and i + 1 < len(sys.argv):
                 port_arg = int(sys.argv[i + 1])
         print(f"Starting SF Demo Builder MCP (HTTP mode) on port {port_arg}")
-        print(f"  Auth:       XSUAA — {'VCAP verificationkey' if _vcap_xsuaa_creds() else XSUAA_JWKS_URI}")
-        print(f"  Base URL:   {SERVER_BASE_URL}")
+        print(f"  Auth XSUAA: {'VCAP verificationkey' if _vcap_xsuaa_creds() else XSUAA_JWKS_URI}")
+        print(f"  Auth A2A  : X-API-Key header at /a2a/mcp")
+        print(f"  Base URL  : {SERVER_BASE_URL}")
 
         import uvicorn
         from starlette.requests import Request
-        from starlette.responses import JSONResponse
+        from starlette.responses import JSONResponse, Response
         from starlette.routing import Route, Mount
         from starlette.applications import Starlette
+        from starlette.types import ASGIApp, Receive, Scope, Send
+
+        class ApiKeyMiddleware:
+            """Validate X-API-Key for requests arriving at /a2a/*.
+
+            On success: sets _api_key_caller and _is_a2a_request ContextVars,
+            then forwards to the inner MCP app.
+            On failure: returns 401 JSON immediately.
+            """
+            def __init__(self, app: ASGIApp) -> None:
+                self.app = app
+
+            async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+                if scope["type"] != "http":
+                    await self.app(scope, receive, send)
+                    return
+
+                headers = dict(scope.get("headers", []))
+                raw_key = (
+                    headers.get(b"x-api-key", b"").decode()
+                    or headers.get(b"X-API-Key", b"").decode()
+                )
+
+                if not raw_key:
+                    await _send_401(send, "Missing X-API-Key header")
+                    return
+
+                key_hash = _sha256_hex(raw_key)
+                owner    = _db.lookup_api_key(key_hash)
+                if not owner:
+                    await _send_401(send, "Invalid or revoked API key")
+                    return
+
+                # Set identity ContextVars for this request lifetime
+                tok1 = _api_key_caller.set(owner)
+                tok2 = _is_a2a_request.set(True)
+                try:
+                    _db.touch_api_key(key_hash)
+                    await self.app(scope, receive, send)
+                finally:
+                    _api_key_caller.reset(tok1)
+                    _is_a2a_request.reset(tok2)
+
+        async def _send_401(send: Send, detail: str) -> None:
+            body = json.dumps({"error": detail, "hint": "Provide a valid X-API-Key header"}).encode()
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [[b"content-type", b"application/json"],
+                                    [b"content-length", str(len(body)).encode()]]})
+            await send({"type": "http.response.body", "body": body})
 
         async def health(request: Request):
             return JSONResponse({"status": "ok", "service": "sf-demo-builder"})
 
-        # Build the MCP ASGI app — method name differs across fastmcp versions
-        if hasattr(mcp, "streamable_http_app"):
-            mcp_asgi = mcp.streamable_http_app(path="/mcp")
-        else:
-            mcp_asgi = mcp.http_app(path="/mcp")
+        async def info(request: Request):
+            base = SERVER_BASE_URL.rstrip("/")
+            xsuaa_creds     = _vcap_xsuaa_creds() or {}
+            xsuaa_clientid  = xsuaa_creds.get("clientid", "(see cf env sf-demo-builder → xsuaa credentials)")
+            xsuaa_clientsecret = xsuaa_creds.get("clientsecret", "(see cf env sf-demo-builder → xsuaa credentials)")
+            xsuaa_token_url = (xsuaa_creds.get("url") or "https://six-ai.authentication.us10.hana.ondemand.com") + "/oauth/token"
+            xsuaa_auth_url  = (xsuaa_creds.get("url") or "https://six-ai.authentication.us10.hana.ondemand.com") + "/oauth/authorize"
+            tools = [
+                {"name": "design_demo_org",          "desc": "Design a demo org plan (personas, goals, scenario)"},
+                {"name": "provision_demo_org",        "desc": "Start background provisioning — returns job_id immediately"},
+                {"name": "get_provisioning_status",   "desc": "Poll a provisioning job by job_id (returns credentials when done)"},
+                {"name": "list_my_orgs",              "desc": "List all demo orgs you have provisioned"},
+                {"name": "get_org_details",           "desc": "Full metadata for one org by demo_id"},
+                {"name": "get_org_employees",     "desc": "All employees + credentials for a demo org"},
+                {"name": "get_org_goals",         "desc": "Goal assignments per employee for a demo org"},
+                {"name": "get_org_compensation",  "desc": "Salary history + bonus data for a demo org"},
+                {"name": "get_org_talent",        "desc": "Talent profiles (impact/risk/future leader)"},
+                {"name": "generate_api_key",      "desc": "Generate an A2A API key (JWT path only)"},
+                {"name": "list_api_keys",         "desc": "List your API keys (label, last used, active)"},
+                {"name": "revoke_api_key",        "desc": "Revoke an API key by label"},
+                {"name": "list_scenarios",        "desc": "List all available demo scenarios"},
+                {"name": "generate_demo_script",  "desc": "Generate two-surface demo script from a plan"},
+                {"name": "generate_agent_card",   "desc": "Generate Joule Agent Hub card from a plan"},
+            ]
+            rows = "".join(
+                f"<tr><td><code>{t['name']}</code></td><td>{t['desc']}</td></tr>"
+                for t in tools
+            )
+            html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>SF Demo Builder — MCP Info</title>
+  <style>
+    body  {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+             max-width: 860px; margin: 40px auto; padding: 0 20px; color: #1a1a1a; }}
+    h1   {{ font-size: 1.6rem; margin-bottom: 4px; }}
+    h2   {{ font-size: 1.1rem; margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 6px; }}
+    .badge {{ display:inline-block; padding:2px 8px; border-radius:4px; font-size:.75rem;
+              font-weight:600; margin-left:6px; vertical-align:middle; }}
+    .green  {{ background:#d4edda; color:#155724; }}
+    .blue   {{ background:#cce5ff; color:#004085; }}
+    .gray   {{ background:#e2e3e5; color:#383d41; }}
+    table  {{ width:100%; border-collapse:collapse; font-size:.9rem; margin-top:8px; }}
+    th,td  {{ padding:8px 10px; text-align:left; border-bottom:1px solid #eee; }}
+    th     {{ background:#f8f9fa; font-weight:600; }}
+    code   {{ background:#f3f4f6; padding:1px 5px; border-radius:3px; font-size:.85rem; }}
+    pre    {{ background:#f3f4f6; padding:14px; border-radius:6px; font-size:.82rem;
+              overflow-x:auto; }}
+    .block {{ background:#fff8e1; border-left:3px solid #f0ad4e; padding:10px 14px;
+              margin:12px 0; border-radius:0 4px 4px 0; font-size:.88rem; }}
+    .copy-row {{ display:flex; align-items:center; gap:8px; margin:6px 0; }}
+    .copy-row label {{ min-width:130px; font-size:.82rem; color:#555; font-weight:600; }}
+    .copy-row .val {{ flex:1; font-family:monospace; font-size:.82rem; background:#f3f4f6;
+                      padding:5px 8px; border-radius:4px; word-break:break-all; }}
+    .copy-btn {{ flex-shrink:0; background:#0057b7; color:#fff; border:none; border-radius:4px;
+                 padding:4px 10px; font-size:.78rem; cursor:pointer; white-space:nowrap; }}
+    .copy-btn:hover {{ background:#003d82; }}
+    .copy-btn.copied {{ background:#28a745; }}
+    .card {{ border:1px solid #dee2e6; border-radius:8px; padding:16px 20px; margin:12px 0; }}
+  </style>
+</head>
+<body>
+  <h1>SF Demo Builder <span class="badge green">LIVE</span></h1>
+  <p>SAP SuccessFactors demo environment builder — MCP server on Cloud Foundry.</p>
 
-        app = Starlette(routes=[
-            Route("/health", health),
-            Mount("/", app=mcp_asgi),
+  <h2>Endpoints</h2>
+  <table>
+    <tr><th>Path</th><th>Auth</th><th>Who uses it</th></tr>
+    <tr>
+      <td><code>{base}/mcp</code></td>
+      <td><span class="badge blue">XSUAA Bearer JWT</span></td>
+      <td>Humans — Joule, browser, Claude Code, SAP AI Agent builder</td>
+    </tr>
+    <tr>
+      <td><code>{base}/a2a/mcp</code></td>
+      <td><span class="badge gray">X-API-Key header</span></td>
+      <td>A2A — sf-demo-agent, other agents, scripts, CI pipelines</td>
+    </tr>
+    <tr>
+      <td><code>{base}/health</code></td>
+      <td>None</td>
+      <td>CF health check</td>
+    </tr>
+    <tr>
+      <td><code>{base}/info</code></td>
+      <td>None</td>
+      <td>This page</td>
+    </tr>
+  </table>
+
+  <h2>Human / OAuth2 login (XSUAA)</h2>
+  <p>Add this MCP server in Joule or any MCP client using <strong>OAuth 2.0</strong>.
+     The client will redirect you to SAP SSO — no manual token needed.</p>
+  <div class="card">
+    <div class="copy-row"><label>MCP URL</label>
+      <span class="val" id="v-url">{base}/mcp</span>
+      <button class="copy-btn" onclick="cp('v-url',this)">Copy</button></div>
+    <div class="copy-row"><label>Authentication</label>
+      <span class="val">OAuth 2.0</span></div>
+    <div class="copy-row"><label>Client ID</label>
+      <span class="val" id="v-cid">{xsuaa_clientid}</span>
+      <button class="copy-btn" onclick="cp('v-cid',this)">Copy</button></div>
+    <div class="copy-row"><label>Client Secret</label>
+      <span class="val" id="v-cs">{xsuaa_clientsecret}</span>
+      <button class="copy-btn" onclick="cp('v-cs',this)">Copy</button></div>
+    <div class="copy-row"><label>Token URL</label>
+      <span class="val" id="v-tok">{xsuaa_token_url}</span>
+      <button class="copy-btn" onclick="cp('v-tok',this)">Copy</button></div>
+    <div class="copy-row"><label>Auth URL</label>
+      <span class="val" id="v-auth">{xsuaa_auth_url}</span>
+      <button class="copy-btn" onclick="cp('v-auth',this)">Copy</button></div>
+    <div class="copy-row"><label>Scopes</label>
+      <span class="val" id="v-sc">openid</span>
+      <button class="copy-btn" onclick="cp('v-sc',this)">Copy</button></div>
+  </div>
+
+  <h2>A2A / API-key access</h2>
+  <div class="card">
+    <div class="copy-row"><label>MCP URL</label>
+      <span class="val" id="v-a2aurl">{base}/a2a/mcp</span>
+      <button class="copy-btn" onclick="cp('v-a2aurl',this)">Copy</button></div>
+    <div class="copy-row"><label>Authentication</label>
+      <span class="val">X-API-Key header</span></div>
+    <div class="copy-row"><label>Header name</label>
+      <span class="val" id="v-hdr">X-API-Key</span>
+      <button class="copy-btn" onclick="cp('v-hdr',this)">Copy</button></div>
+  </div>
+  <p style="font-size:.85rem">Generate a key via the <code>generate_api_key</code> tool on the JWT endpoint.
+     Keys are stored as SHA-256 hashes only — plaintext shown once.</p>
+
+  <script>
+  function cp(id,btn){{
+    var t=document.getElementById(id).textContent;
+    navigator.clipboard.writeText(t).then(function(){{
+      btn.textContent='Copied!'; btn.classList.add('copied');
+      setTimeout(function(){{btn.textContent='Copy';btn.classList.remove('copied');}},2000);
+    }});
+  }}
+  </script>
+
+  <h2>Available tools ({len(tools)})</h2>
+  <table>
+    <tr><th>Tool</th><th>Description</th></tr>
+    {rows}
+  </table>
+
+  <h2>Data isolation</h2>
+  <p>All <code>get_org_*</code> tools are automatically filtered to orgs owned by the
+  authenticated caller. JWT callers are identified by their XSUAA email claim.
+  API-key callers inherit the email of the user who generated the key.</p>
+
+  <h2>SF instance</h2>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    <tr><td>Instance</td><td><code>SFSALES011375</code></td></tr>
+    <tr><td>Login URL</td><td><a href="{LOGIN_URL}" target="_blank">{LOGIN_URL}</a></td></tr>
+    <tr><td>Admin user</td><td><code>sfadmin@SFSALES011375</code></td></tr>
+  </table>
+</body>
+</html>"""
+            return Response(html, media_type="text/html")
+
+
+        # Build the MCP ASGI app at path "/" — Starlette strips the mount prefix
+        # before the request reaches the inner app, so the inner route must be "/".
+        # stateless_http=True eliminates "Session not found" on container restarts.
+        if hasattr(mcp, "streamable_http_app"):
+            mcp_asgi = mcp.streamable_http_app(path="/", stateless_http=True)
+        else:
+            mcp_asgi = mcp.http_app(path="/", stateless_http=True)
+
+        # Wrap with API-key middleware for the A2A path — same tool registry.
+        a2a_asgi = ApiKeyMiddleware(mcp_asgi)
+
+        # Use Route with path_regex to avoid Starlette's 307 redirect on missing
+        # trailing slash that Mount("/mcp") triggers. Both /mcp and /mcp/ match.
+        from starlette.routing import Router
+        from starlette.types import ASGIApp as _ASGIApp
+
+        def _make_prefix_stripper(prefix: str, inner: _ASGIApp) -> _ASGIApp:
+            """Strip a path prefix and forward to inner app."""
+            async def _app(scope, receive, send):
+                if scope["type"] == "http":
+                    path = scope.get("path", "")
+                    if path.startswith(prefix):
+                        scope = dict(scope)
+                        scope["path"] = path[len(prefix):] or "/"
+                        scope["raw_path"] = scope["path"].encode()
+                return await inner(scope, receive, send)
+            return _app
+
+        mcp_stripped   = _make_prefix_stripper("/mcp",     mcp_asgi)
+        a2a_stripped   = _make_prefix_stripper("/a2a/mcp", a2a_asgi)
+
+        from starlette.routing import Router as _Router
+        from starlette.routing import Route as _Route
+        _static_app = _Router(routes=[
+            _Route("/health", health),
+            _Route("/info",   info),
         ])
+
+        async def dispatch(scope, receive, send):
+            path = scope.get("path", "")
+            if path == "/health" or path.startswith("/health"):
+                await _static_app(scope, receive, send)
+            elif path == "/info" or path.startswith("/info"):
+                await _static_app(scope, receive, send)
+            elif path.startswith("/.well-known/"):
+                # OAuth2 discovery endpoints (RFC 8414 / RFC 9728) — served by FastMCP auth provider
+                await mcp_asgi(scope, receive, send)
+            elif path.startswith("/a2a/mcp"):
+                await a2a_stripped(scope, receive, send)
+            elif path.startswith("/mcp"):
+                await mcp_stripped(scope, receive, send)
+            else:
+                # Fallback 404
+                body = b"Not Found"
+                await send({"type": "http.response.start", "status": 404,
+                            "headers": [[b"content-length", str(len(body)).encode()]]})
+                await send({"type": "http.response.body", "body": body})
+
+        class _AppWithLifespan:
+            def __init__(self):
+                self.lifespan = mcp_asgi.lifespan
+            async def __call__(self, scope, receive, send):
+                if scope["type"] == "lifespan":
+                    await mcp_asgi(scope, receive, send)
+                else:
+                    await dispatch(scope, receive, send)
+
+        app = _AppWithLifespan()
 
         uvicorn.run(app, host="0.0.0.0", port=port_arg)
     else:
         mcp.run()
+

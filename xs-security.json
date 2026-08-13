@@ -1,0 +1,17 @@
+{
+  "xsappname": "na-1ae41fab-c303-40e9-b527-c3157a41111f",
+  "tenant-mode": "shared",
+  "description": "XSUAA config for SF Demo Builder MCP server",
+  "scopes": [],
+  "role-templates": [],
+  "oauth2-configuration": {
+    "redirect-uris": [
+      "https://sf-demo-builder.cfapps.us10.hana.ondemand.com/**",
+      "http://localhost:*/**",
+      "https://localhost:*/**"
+    ],
+    "token-validity": 43200,
+    "autoapprove": true,
+    "allowedproviders": ["sap.default"]
+  }
+}
