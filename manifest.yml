@@ -1,0 +1,19 @@
+---
+applications:
+  - name: sf-demo-builder
+    memory: 512M
+    instances: 1
+    buildpacks:
+      - python_buildpack
+    stack: cflinuxfs4
+    command: python server.py
+    health-check-type: http
+    health-check-http-endpoint: /health
+    env:
+      SF_ADMIN_USER: sfadmin@SFSALES011375
+      EMAIL_PREFIX: siddhartha.bhattacharya
+      # SERVER_BASE_URL is set post-push once route is known
+      # SF_ADMIN_PASS, IAS_CLIENT_ID, IAS_CLIENT_SECRET set via cf set-env
+    services:
+      - sf-demo-builder-uaa
+      - hana

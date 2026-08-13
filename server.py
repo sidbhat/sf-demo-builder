@@ -29,12 +29,15 @@ import json
 import base64
 import ssl
 import sys
+import uuid
 import urllib.request
 import urllib.parse
 import time
 import os
 from datetime import datetime
 from typing import Optional
+
+import db as _db
 
 # ── Auth configuration ────────────────────────────────────────────────────────
 # SAP accounts.sap.com OIDC — tokens issued by SAP employee login
@@ -50,23 +53,56 @@ SERVER_BASE_URL = os.environ.get(
 )
 PORT = int(os.environ.get("PORT", "8000"))
 
-# Build auth provider when running in HTTP mode (--http flag)
+# Build auth provider when running in HTTP mode (--http flag or PORT set by CF)
 # In stdio mode (default, used by Claude Code MCP) auth is bypassed —
 # the local process boundary is the trust boundary.
-_HTTP_MODE = "--http" in sys.argv
+_HTTP_MODE = "--http" in sys.argv or "VCAP_APPLICATION" in os.environ
+
+
+def _vcap_xsuaa_creds() -> Optional[dict]:
+    """Extract XSUAA credentials from VCAP_SERVICES (CF runtime)."""
+    vcap = os.environ.get("VCAP_SERVICES")
+    if not vcap:
+        return None
+    try:
+        services = json.loads(vcap)
+        instances = services.get("xsuaa", [])
+        # prefer the one named for this app
+        for inst in instances:
+            if "sf-demo-builder" in inst.get("name", ""):
+                return inst["credentials"]
+        return instances[0]["credentials"] if instances else None
+    except Exception:
+        return None
+
 
 def _build_auth():
     if not _HTTP_MODE:
         return None
     from fastmcp.server.auth import RemoteAuthProvider, JWTVerifier
-    verifier = JWTVerifier(
-        jwks_uri=XSUAA_JWKS_URI,
-        issuer=XSUAA_ISSUER,
-        algorithm="RS256",
-    )
+
+    vcap_creds = _vcap_xsuaa_creds()
+    if vcap_creds and vcap_creds.get("verificationkey"):
+        # CF runtime: use inline RSA public key from XSUAA service binding
+        issuer = vcap_creds.get("url", XSUAA_ISSUER)
+        verifier = JWTVerifier(
+            public_key=vcap_creds["verificationkey"],
+            issuer=issuer,
+            algorithm="RS256",
+        )
+        auth_servers = [issuer]
+    else:
+        # Local / custom: use JWKS URI
+        verifier = JWTVerifier(
+            jwks_uri=XSUAA_JWKS_URI,
+            issuer=XSUAA_ISSUER,
+            algorithm="RS256",
+        )
+        auth_servers = [XSUAA_ISSUER]
+
     return RemoteAuthProvider(
         token_verifier=verifier,
-        authorization_servers=[XSUAA_ISSUER],
+        authorization_servers=auth_servers,
         base_url=SERVER_BASE_URL,
         resource_name="SF Demo Builder",
     )
@@ -1425,11 +1461,63 @@ def provision_demo_org(plan_json: str) -> str:
     locale      = plan["locale"]
     industry    = plan["industry"]
 
-    HIRE_DATE   = "/Date(1735689600000)/"   # 2025-01-01
-    HIRE_STR    = "2025-01-01T00:00:00"
-    BONUS_DATE  = "/Date(1766620800000)/"   # 2025-12-25
-    BONUS_STR   = "2025-12-25T00:00:00"
+    # Unique ID for this provisioned org — stored in HANA, returned to caller
+    demo_id = str(uuid.uuid4())
+
+    # Caller identity from principal propagation (populated in HTTP mode)
+    caller_email = plan.get("caller", {}).get("email")
+
+    # ── All dates relative to today ───────────────────────────────────────────
+    _today = datetime.now()
+
+    def _epoch_ms(dt) -> str:
+        import calendar
+        ts = int(calendar.timegm(dt.timetuple())) * 1000
+        return f"/Date({ts})/"
+
+    def _dt_str(dt) -> str:
+        return dt.strftime("%Y-%m-%dT00:00:00")
+
+    # Foundation object start (far past — fixed)
     START_DATE  = "/Date(-2208988800000)/"  # 1900-01-01
+
+    # Hire date: 18 months ago (employees have been here a while)
+    _hire_dt    = _today.replace(year=_today.year - 1, month=max(1, _today.month - 6))
+    HIRE_DATE   = _epoch_ms(_hire_dt)
+    HIRE_STR    = _dt_str(_hire_dt)
+
+    # Year-end bonus: last Dec 25 (past)
+    _bonus_yr   = _today.year if _today.month > 12 else _today.year - 1
+    from datetime import date as _date
+    _bonus_dt   = _date(_bonus_yr, 12, 25)
+    import calendar as _cal
+    BONUS_DATE  = f"/Date({int(_cal.timegm(_bonus_dt.timetuple())) * 1000})/"
+    BONUS_STR   = f"{_bonus_yr}-12-25T00:00:00"
+
+    # Onboardee start: 3 weeks from today
+    import datetime as _dt_mod
+    _onb_dt     = _today + _dt_mod.timedelta(weeks=3)
+    ONB_DATE    = _epoch_ms(_onb_dt)
+    ONB_STR     = _dt_str(_onb_dt)
+
+    # Goals: start Jan 1 this year, due Dec 31 this year
+    _goal_start = _date(_today.year, 1, 1)
+    _goal_due   = _date(_today.year, 12, 31)
+    GOAL_START  = f"/Date({int(_cal.timegm(_goal_start.timetuple())) * 1000})/"
+    GOAL_DUE    = f"/Date({int(_cal.timegm(_goal_due.timetuple())) * 1000})/"
+
+    # Salary history: 3 years ago, 2 years ago, current hire date
+    def _sal_dates():
+        """Return (date_str, epoch_str) for 3 salary history entries."""
+        entries = []
+        for years_back in (3, 2, 0):
+            yr = _today.year - years_back
+            mo = _hire_dt.month
+            dt = _date(yr, mo, 1)
+            entries.append((_dt_str(datetime(yr, mo, 1)), _epoch_ms(datetime(yr, mo, 1))))
+        return entries  # [(str, epoch), (str, epoch), (str, epoch)]
+
+    _sal_history_dates = _sal_dates()
 
     results = {}
     all_errors = []
@@ -1590,11 +1678,13 @@ def provision_demo_org(plan_json: str) -> str:
     sal_rows = []
     for e in employees:
         uid = e["userId"]
-        for seq, sal in enumerate(e["salaryHistory"], start=1):
+        for seq, (sal, (sal_str, sal_epoch)) in enumerate(
+            zip(e["salaryHistory"], _sal_history_dates), start=1
+        ):
             sal_rows.append({
-                "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber={seq}L,startDate=datetime'{HIRE_STR}',userId='{uid}')"},
+                "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber={seq}L,startDate=datetime'{sal_str}',userId='{uid}')"},
                 "payComponent": "BASESAL_US", "userId": uid,
-                "startDate": HIRE_DATE, "seqNumber": seq,
+                "startDate": sal_epoch, "seqNumber": seq,
                 "paycompvalue": float(sal), "currencyCode": locale["currency"],
             })
     ok_sal, errs = _sf_upsert(sal_rows)
@@ -1677,8 +1767,8 @@ def provision_demo_org(plan_json: str) -> str:
     onb_mgr  = employees[1]["userId"]
     onb_dept = employees[1]["dept"]
     onb_pos  = employees[1]["position"]
-    ONB_DATE  = "/Date(1762128000000)/"   # 2025-11-03
-    ONB_STR   = "2025-11-03T00:00:00"
+    ONB_DATE  = _epoch_ms(_onb_dt)   # 3 weeks from today — computed in date block
+    ONB_STR   = _dt_str(_onb_dt)
 
     ok1, _ = _sf_upsert([{
         "__metadata": {"uri": f"User('{onb_uid}')"},
@@ -1823,19 +1913,42 @@ def provision_demo_org(plan_json: str) -> str:
 
     joule_lines = [f"  • {p}" for p in plan.get("joule_prompts", [])]
 
+    # ── Persist to HANA ───────────────────────────────────────────────────────
+    db_status = "not_persisted"
+    try:
+        _db.save_demo_org(
+            demo_id=demo_id,
+            company_code=co,
+            company_name=name,
+            industry=plan["industry"],
+            country=plan.get("country", ""),
+            scenario=plan.get("scenario_label", ""),
+            password=password,
+            created_by=caller_email,
+            employees=employees,
+            email_prefix=email_pfx,
+        )
+        db_status = "saved"
+    except Exception as e:
+        db_status = f"error: {str(e)[:120]}"
+
     output = {
-        "status": "SUCCESS" if not all_errors else f"DONE WITH {len(all_errors)} ERROR(S)",
-        "company":    name,
-        "code":       co,
-        "industry":   plan["industry"],
-        "problem":    plan["scenario_label"],
-        "login_url":  LOGIN_URL,
-        "password":   password,
+        "status":    "SUCCESS" if not all_errors else f"DONE WITH {len(all_errors)} ERROR(S)",
+        "demo_id":   demo_id,
+        "company":   name,
+        "code":      co,
+        "industry":  plan["industry"],
+        "problem":   plan["scenario_label"],
+        "login_url": LOGIN_URL,
+        "password":  password,
+        "created_by": caller_email or "anonymous",
+        "db_status": db_status,
         "phase_results": results,
-        "errors":     all_errors[:10],
+        "errors":    all_errors[:10],
         "confirmation": (
             f"{'='*64}\n"
             f"  {name} ({co}) — {plan['scenario_label']}\n"
+            f"  Demo ID  : {demo_id}\n"
             f"  Instance : SFSALES011375\n"
             f"  Login    : {LOGIN_URL}\n"
             f"  Password : {password}\n"
@@ -1880,6 +1993,56 @@ def list_scenarios() -> str:
             "readiness":       f"{live_count} live / {story_count} story",
         })
     return json.dumps(out, indent=2)
+
+
+# ── Tool: List my provisioned orgs ────────────────────────────────────────────
+
+@mcp.tool()
+def list_my_orgs(ctx=None) -> str:
+    """
+    List all demo orgs you have provisioned, retrieved from HANA.
+
+    Returns org ID, company name, scenario, creation time, and login details
+    for every org associated with your caller email (from XSUAA token).
+
+    In stdio/local mode returns all orgs (no caller filter).
+    """
+    caller_email = _extract_caller_email(ctx)
+    try:
+        orgs = _db.list_demo_orgs(created_by=caller_email)
+        # Convert datetime objects to strings for JSON
+        for o in orgs:
+            if hasattr(o.get("created_at"), "isoformat"):
+                o["created_at"] = o["created_at"].isoformat()
+        return json.dumps({
+            "caller":    caller_email or "anonymous (stdio mode)",
+            "org_count": len(orgs),
+            "orgs":      orgs,
+            "login_url": LOGIN_URL,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "hint": "HANA not available — check VCAP_SERVICES or HANA_* env vars"})
+
+
+@mcp.tool()
+def get_org_details(demo_id: str) -> str:
+    """
+    Get full details for a provisioned demo org by its unique demo_id.
+
+    Returns the org record plus all user emails provisioned in that org.
+    Use this to retrieve login credentials for an org you provisioned earlier.
+
+    Args:
+        demo_id: The UUID returned by provision_demo_org()
+    """
+    try:
+        org = _db.get_demo_org(demo_id)
+        if not org:
+            return json.dumps({"error": f"No org found with demo_id '{demo_id}'"})
+        org["login_url"] = LOGIN_URL
+        return json.dumps(org, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "hint": "HANA not available — check VCAP_SERVICES or HANA_* env vars"})
 
 
 # ── Tool: Generate Agent Hub card ─────────────────────────────────────────────
@@ -2126,17 +2289,34 @@ def generate_demo_script(plan_json: str) -> str:
 
 if __name__ == "__main__":
     if _HTTP_MODE:
-        # HTTP + SSE transport with OAuth2 auth
-        # Usage: python3 server.py --http [--port 8000]
         port_arg = PORT
         for i, arg in enumerate(sys.argv):
             if arg == "--port" and i + 1 < len(sys.argv):
                 port_arg = int(sys.argv[i + 1])
         print(f"Starting SF Demo Builder MCP (HTTP mode) on port {port_arg}")
-        print(f"  Auth:       XSUAA JWT — {XSUAA_JWKS_URI}")
-        print(f"  Issuer:     {XSUAA_ISSUER}")
+        print(f"  Auth:       XSUAA — {'VCAP verificationkey' if _vcap_xsuaa_creds() else XSUAA_JWKS_URI}")
         print(f"  Base URL:   {SERVER_BASE_URL}")
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=port_arg, path="/mcp")
+
+        import uvicorn
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+        from starlette.routing import Route, Mount
+        from starlette.applications import Starlette
+
+        async def health(request: Request):
+            return JSONResponse({"status": "ok", "service": "sf-demo-builder"})
+
+        # Build the MCP ASGI app — method name differs across fastmcp versions
+        if hasattr(mcp, "streamable_http_app"):
+            mcp_asgi = mcp.streamable_http_app(path="/mcp")
+        else:
+            mcp_asgi = mcp.http_app(path="/mcp")
+
+        app = Starlette(routes=[
+            Route("/health", health),
+            Mount("/", app=mcp_asgi),
+        ])
+
+        uvicorn.run(app, host="0.0.0.0", port=port_arg)
     else:
-        # Default: stdio transport for Claude Code / Joule Desktop MCP
         mcp.run()
