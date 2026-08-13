@@ -1463,7 +1463,7 @@ def design_demo_org(
     company_code: Optional[str] = None,
     employee_prefix: Optional[str] = None,
     email_prefix: Optional[str] = None,
-    password: str = "MarsD2025",
+    password: str = "",
     personas: Optional[list] = None,
     scenario_override: Optional[dict] = None,
     ctx=None,
@@ -1556,6 +1556,11 @@ def design_demo_org(
 
     locale = LOCALE_CONFIG.get(country_key, LOCALE_CONFIG["USA"])
     scenario = scenario_override if scenario_override else SCENARIO_KB[problem_key]
+
+    # Generate unique password per org — avoids IAS password history rejection on re-runs
+    if not password:
+        suffix = secrets.token_hex(2).upper()  # e.g. "A3F2"
+        password = f"Demo{suffix}26!"          # e.g. "DemoA3F226!"
 
     # Auto-assign company code if not given (hash company name to 4-digit range 5000-9000)
     if not company_code:
@@ -1800,9 +1805,9 @@ def design_demo_org(
             ),
         },
         "agent_card": {
-            "title":     f"{company_name} — {card['title']}",
-            "challenge": card["challenge"],
-            "prompts":   card["prompts"],
+            "title":     f"{company_name} — {card.get('title', company_name)}",
+            "challenge": card.get("challenge", business_problem),
+            "prompts":   card.get("prompts", scenario.get("joule_prompts", [])),
             "live_count":  len(live_items),
             "story_count": len(story_items),
             "joule_url":   _design_sf["login_url"],
@@ -2335,7 +2340,6 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "nominatorId":  ceo_id,
             "awardAmount":  float(pts),
             "currency":     "POINTS",
-            "spotAwardProgram": "WOW Awards!",
             "category":     "1",
             "level":        "1",
             "approvalStatus": "APPROVED",
