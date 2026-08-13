@@ -2477,8 +2477,10 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     ias_ok = 0
     for e in all_users_ias:
         email = f"{email_pfx}+{e['email_tag']}.{uid6}@sap.com"
-        success, _ = _ias_ensure_user(
-            username=e["username"],
+        # IAS userName must be the short username only (e.g. "fed.dir"), not "fed.dir@COMPANY"
+        ias_username = e["username"].split("@")[0] if "@" in e.get("username", "") else e["username"]
+        success, ias_err = _ias_ensure_user(
+            username=ias_username,
             password=password,
             email=email,
             first_name=e.get("firstName", ""),
@@ -2487,6 +2489,8 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
         )
         if success:
             ias_ok += 1
+        else:
+            print(f"[ias] FAIL user={ias_username} email={email} err={ias_err}", flush=True)
         time.sleep(0.5)
     results["IASPasswords"] = f"{ias_ok}/{len(all_users_ias)}"
 
