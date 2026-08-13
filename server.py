@@ -1561,13 +1561,16 @@ def design_demo_org(
     if not company_code:
         company_code = str(5000 + (hash(company_name) % 4000))
 
-    # Auto-assign employee prefix from company name
+    # Auto-assign employee prefix from company name + 3-char random hex suffix
+    # so multiple orgs for the same company get unique user IDs and SF usernames.
     if not employee_prefix:
         words = company_name.upper().split()
         if len(words) >= 2:
-            employee_prefix = words[0][:1] + words[1][:1]
+            base_prefix = words[0][:1] + words[1][:1]
         else:
-            employee_prefix = company_name.upper()[:3]
+            base_prefix = company_name.upper()[:3]
+        suffix = secrets.token_hex(2)[:3].upper()  # e.g. "A3F"
+        employee_prefix = base_prefix + suffix      # e.g. "HQA3F"
 
     # Build employee roster — agent-provided personas take precedence over static tables
     employees = []
