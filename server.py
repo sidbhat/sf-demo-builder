@@ -1347,8 +1347,8 @@ def _sf_post(entity: str, row: dict, sf: dict) -> tuple[bool, str]:
 
 
 def _sf_post_as_user(entity: str, row: dict, username: str, password: str, sf: dict) -> tuple[bool, str]:
-    """POST to SF OData authenticated as a specific user (required for Goal entities).
-    Goal auth uses the SF tenant company code (e.g. SFSALES011375), NOT the demo company code."""
+    """POST to SF OData for Goal entities.
+    Try as the user first; fall back to sfadmin if user lacks OData permission (LGN0002)."""
     full_user = f"{username}@{sf['company_code']}" if "@" not in username else username
     creds = base64.b64encode(f"{full_user}:{password}".encode()).decode()
     hdrs = {**sf['sf_headers'], "Authorization": f"Basic {creds}"}
@@ -1361,6 +1361,16 @@ def _sf_post_as_user(entity: str, row: dict, username: str, password: str, sf: d
             return True, "ok"
     except urllib.error.HTTPError as e:
         err = e.read().decode(errors="replace")
+        try:
+            msg = json.loads(err)["error"]["message"]["value"]
+        except Exception:
+            msg = err[:200]
+        # LGN0002 = user lacks OData API permission — fall back to sfadmin
+        if "lgn0002" in msg.lower() or "admin permission" in msg.lower():
+            return _sf_post(entity, row, sf)
+        if "already exists" in msg.lower() or "duplicate" in msg.lower():
+            return True, "already_exists"
+        return False, msg[:120]
         try:
             msg = json.loads(err)["error"]["message"]["value"]
         except Exception:
@@ -1443,7 +1453,21 @@ def _ias_ensure_user(username: str, password: str, email: str,
         with urllib.request.urlopen(req, context=CTX, timeout=15) as r:
             return True, str(r.status)
     except urllib.error.HTTPError as e:
-        return False, f"PUT HTTP {e.code}: {e.read().decode(errors='replace')[:100]}"
+        body = e.read().decode(errors="replace")
+        # IAS password history policy — retry with a fresh random password
+        if e.code == 400 and "password" in body.lower() and "history" in body.lower():
+            user_data["password"] = "Demo" + secrets.token_hex(3).upper() + "26!"
+            payload2 = json.dumps(user_data).encode()
+            req2 = urllib.request.Request(
+                f"{ias_scim}/{scim_id}", data=payload2, method="PUT",
+                headers={"Authorization": ias_auth, "Content-Type": "application/scim+json",
+                         "Accept": "application/scim+json"})
+            try:
+                with urllib.request.urlopen(req2, context=CTX, timeout=15) as r2:
+                    return True, f"retry_ok:{r2.status}"
+            except urllib.error.HTTPError as e2:
+                return False, f"PUT retry HTTP {e2.code}: {e2.read().decode(errors='replace')[:80]}"
+        return False, f"PUT HTTP {e.code}: {body[:100]}"
 
 
 def _ias_set_password(username: str, password: str, email: str, sf: Optional[dict] = None) -> tuple[bool, str]:
