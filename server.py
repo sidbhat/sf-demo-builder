@@ -1347,7 +1347,8 @@ def _sf_post(entity: str, row: dict, sf: dict) -> tuple[bool, str]:
 
 
 def _sf_post_as_user(entity: str, row: dict, username: str, password: str, sf: dict) -> tuple[bool, str]:
-    """POST to SF OData authenticated as a specific user (required for Goal entities)."""
+    """POST to SF OData authenticated as a specific user (required for Goal entities).
+    Goal auth uses the SF tenant company code (e.g. SFSALES011375), NOT the demo company code."""
     full_user = f"{username}@{sf['company_code']}" if "@" not in username else username
     creds = base64.b64encode(f"{full_user}:{password}".encode()).decode()
     hdrs = {**sf['sf_headers'], "Authorization": f"Basic {creds}"}
@@ -1550,6 +1551,9 @@ def design_demo_org(
     if country_key not in LOCALE_CONFIG:
         country_key = "USA"  # default fallback
 
+    if n_employees < 2:
+        return json.dumps({"error": "n_employees must be at least 2 (1 manager + 1 report required for org hierarchy)."})
+
     locale = LOCALE_CONFIG.get(country_key, LOCALE_CONFIG["USA"])
     scenario = scenario_override if scenario_override else SCENARIO_KB[problem_key]
 
@@ -1721,7 +1725,7 @@ def design_demo_org(
         ("ias_login",             "✅ LIVE", "All users login-ready via IAS SCIM password set"),
         ("goal_assignments",      "✅ LIVE", "Goal_11 annual goals + DevGoal_2001 dev goals per employee"),
     ]
-    scenario_live = set(scenario["live_data"])
+    scenario_live = set(scenario.get("live_data", []))
     story_entities = [
         ("job_requisitions",         "📖 STORY", "Open reqs with job descriptions and requirements"),
         ("candidate_pipeline",       "📖 STORY", "Candidates at various stages — screening, interview, offer"),
@@ -1755,11 +1759,12 @@ def design_demo_org(
     for key, status, desc in all_live:
         if any(k in scenario_live for k in [key, key.rstrip("s")]):
             live_items.append({"status": status, "entity": key, "description": desc})
+    scenario_story_data = scenario.get("story_data", [])
     for key, status, desc in story_entities:
-        if key in scenario["story_data"]:
+        if key in scenario_story_data:
             story_items.append({"status": status, "entity": key, "description": desc})
 
-    card = scenario["agent_card"]
+    card = scenario.get("agent_card", {})
     plan = {
         "plan_version":    "1.0",
         "company_name":    company_name,
@@ -1768,16 +1773,16 @@ def design_demo_org(
         "country":         country_key,
         "locale":          locale,
         "business_problem": problem_key,
-        "scenario_label":  scenario["label"],
+        "scenario_label":  scenario.get("label", scenario.get("scenario", "")),
         "employee_prefix": employee_prefix,
         "email_prefix":    email_prefix,
         "password":        password,
         "n_employees":     len(employees),
         "employees":       employees,
         "org_chart": "\n".join(org_lines),
-        "scenario_narrative": scenario["talent_story"],
-        "story_data_narrative": scenario["story_narrative"],
-        "joule_prompts":   scenario["joule_prompts"],
+        "scenario_narrative": scenario.get("talent_story", scenario.get("scenario", "")),
+        "story_data_narrative": scenario.get("story_narrative", ""),
+        "joule_prompts":   scenario.get("joule_prompts", []),
         "live_data":       live_items,
         "story_data":      story_items,
         # Principal propagation: who called this and which persona they map to
@@ -2042,6 +2047,12 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     demo_id = str(uuid.uuid4())
     uid6 = demo_id[:6]  # short suffix to make emails unique per org run
 
+    if len(employees) < 2:
+        _JOBS[job_id] = {"status": "error", "result": None,
+                         "error": "Org plan must have at least 2 employees (1 manager + 1 report). Please redesign with n_employees ≥ 2.",
+                         "started_at": time.time()}
+        return
+
     # Caller identity: prefer the snapshot passed from the MCP tool (captured before threading),
     # fall back to whatever the plan carries.
     caller_email = caller_email or plan.get("caller", {}).get("email")
@@ -2257,13 +2268,11 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     sal_rows = []
     for e in employees:
         uid = e["userId"]
-        for seq, (sal, (sal_str, sal_epoch)) in enumerate(
-            zip(e["salaryHistory"], _sal_history_dates), start=1
-        ):
+        for seq, sal in enumerate(e["salaryHistory"], start=1):
             sal_rows.append({
-                "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber={seq}L,startDate=datetime'{sal_str}',userId='{uid}')"},
+                "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber={seq}L,startDate=datetime'{HIRE_STR}',userId='{uid}')"},
                 "payComponent": "BASESAL_US", "userId": uid,
-                "startDate": sal_epoch, "seqNumber": seq,
+                "startDate": HIRE_DATE, "seqNumber": seq,
                 "paycompvalue": float(sal), "currencyCode": locale["currency"],
             })
     ok_sal, errs = _sf_upsert(sal_rows, sf)
@@ -2275,9 +2284,9 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     for e in employees:
         uid = e["userId"]
         bonus_rows.append({
-            "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber=1L,startDate=datetime'{BONUS_STR}',userId='{uid}')"},
+            "__metadata": {"uri": f"EmpPayCompRecurring(payComponent='BASESAL_US',seqNumber=4L,startDate=datetime'{HIRE_STR}',userId='{uid}')"},
             "payComponent": "BASESAL_US", "userId": uid,
-            "startDate": BONUS_DATE, "seqNumber": 1,
+            "startDate": HIRE_DATE, "seqNumber": 4,
             "paycompvalue": float(e["yearEndBonus"]),
             "currencyCode": locale["currency"],
         })
@@ -2301,7 +2310,8 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     all_errors.extend(errs)
 
     # ── Phase 13: Spot awards ──────────────────────────────────────────────────
-    BASE_CODE = 800000 + int(''.join(filter(str.isdigit, co)) or '1')
+    # Use uid6 to avoid code collisions across multiple orgs with the same company code
+    BASE_CODE = 800000 + (int(uid6, 16) % 99000)
     _default_award_msgs = [
         "Outstanding delivery — shipped ahead of schedule and under budget",
         "Strategic win — resolved a key risk that was blocking the roadmap",
@@ -2332,6 +2342,8 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
         award_rows.append(row)
     ok, errs = _sf_upsert(award_rows, sf)
     results["SpotAwards"] = f"{ok}/{len(award_rows)}"
+    if errs:
+        print(f"[spot_awards] errors codes={[r['externalCode'] for r in award_rows]} errs={errs[:3]}", flush=True)
     # Don't surface spot award eligibility errors — graceful
     non_eligibility_errs = [e for e in errs if "not eligible" not in e.lower()]
     all_errors.extend(non_eligibility_errs)
@@ -2384,9 +2396,7 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
 
     # ── Phase 15: Goals (Goal_11 annual + DevGoal_2001 dev goals) ────────────────
     # Goals must be created as the user themselves — sfadmin gets 403.
-    # We can only create goals once IAS passwords are set (Phase 16).
-    # Strategy: create goals after IAS setup, or skip if IAS not ready yet.
-    # For now: create goals using the SF user credentials (username@SFSALES011375:password).
+    # Auth: username@<SF_TENANT_company_code>:password (e.g. username@SFSALES011375)
     goals_ok = 0
     goals_total = 0
     # Dates relative to today: start = Jan 1 of current year, due = Dec 31 of current year
@@ -2418,7 +2428,7 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
         ]
         for goal in annual_goals:
             goals_total += 1
-            ok, _ = _sf_post_as_user("Goal_11", {
+            ok, gerr = _sf_post_as_user("Goal_11", {
                 "userId": e["userId"],
                 "type": "user",
                 "name": goal["name"],
@@ -2432,9 +2442,12 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             }, e["username"], password, sf)
             if ok:
                 goals_ok += 1
+            else:
+                print(f"[goals] Goal_11 FAIL user={e['username']} demo_co={sf.get('demo_company_code')} err={gerr}", flush=True)
+                all_errors.append(f"Goal_11({e['username']}): {gerr}")
 
         goals_total += 1
-        ok, _ = _sf_post_as_user("DevGoal_2001", {
+        ok, gerr = _sf_post_as_user("DevGoal_2001", {
             "userId": e["userId"],
             "type": "development",
             "name": dgn,
@@ -2448,6 +2461,9 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
         }, e["username"], password, sf)
         if ok:
             goals_ok += 1
+        else:
+            print(f"[goals] DevGoal FAIL user={e['username']} demo_co={sf.get('demo_company_code')} err={gerr}", flush=True)
+            all_errors.append(f"DevGoal_2001({e['username']}): {gerr}")
 
     results["Goals"] = f"{goals_ok}/{goals_total} (Goal_11 x2 + DevGoal_2001 x1 per employee)"
 
