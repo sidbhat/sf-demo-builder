@@ -2344,6 +2344,20 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     # ── Phase 13: Spot awards ──────────────────────────────────────────────────
     # Use uid6 to avoid code collisions across multiple orgs with the same company code
     BASE_CODE = 800000 + (int(uid6, 16) % 99000)
+
+    # Discover the active SpotAwardProgram at runtime — use first active one found
+    _active_program = None
+    try:
+        _prog_url = f"{sf['sf_base']}/SpotAwardProgram?$format=json&$select=externalCode,status&$filter=status%20eq%20'ACTIVE'"
+        _prog_req = urllib.request.Request(_prog_url, headers=sf['sf_headers'])
+        with urllib.request.urlopen(_prog_req, context=CTX, timeout=10) as _r:
+            _progs = json.loads(_r.read()).get("d", {}).get("results", [])
+            if _progs:
+                _active_program = _progs[0]["externalCode"]
+                print(f"[spot_awards] using program={_active_program}", flush=True)
+    except Exception as _e:
+        print(f"[spot_awards] program discovery failed: {_e}", flush=True)
+
     _default_award_msgs = [
         "Outstanding delivery — shipped ahead of schedule and under budget",
         "Strategic win — resolved a key risk that was blocking the roadmap",
@@ -2370,6 +2384,8 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "commentForReceiver": comment,
             "commentForApprovers": "Above guideline: impact warranted top recognition.",
         }
+        if _active_program:
+            row["spotAwardProgram"] = _active_program
         award_rows.append(row)
     ok, errs = _sf_upsert(award_rows, sf)
     results["SpotAwards"] = f"{ok}/{len(award_rows)}"
