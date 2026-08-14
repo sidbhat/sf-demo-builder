@@ -422,7 +422,7 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "fte": 1.0, "jobCode": "50000724", "jobTitle": e["jobTitle"],
             "location": loc_code, "managerId": e["manager"],
             "payGrade": e["payGrade"],
-            "payScaleArea": locale["pay_scale"], "payScaleType": locale["pay_scale"],
+            "payScaleArea": "USA/US1", "payScaleType": "USA/US1",
             "position": e["position"], "standardHours": 40, "timezone": locale["tz"],
             "workscheduleCode": "NORM", "timeTypeProfileCode": "USA_STD",
             "holidayCalendarCode": "USA", "timeRecordingProfileCode": "DUR_NEG",
@@ -457,7 +457,7 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "__metadata": {"uri": f"EmpCompensation(startDate=datetime'{HIRE_STR}',userId='{uid}')"},
             "userId": uid, "startDate": HIRE_DATE,
             "isEligibleForCar": False, "isEligibleForBenefits": True,
-            "payGroup": locale["pay_group"],
+            "payGroup": "US",
         })
     ok_comp, errs = _sf_upsert(comp_rows, sf)
     all_errors.extend(errs)
@@ -629,11 +629,12 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             # Post annual goal (Goal_11)
             try:
                 ok_goal1, _ = _sf_post_as_user("Goal_11", {
-                    "externalCode": f"GOAL_{uid}_2025_01",
-                    "userId": uid, "name": e["goals"]["annual_1_name"],
-                    "startDate": GOAL_START, "dueDate": GOAL_DUE,
-                    "description": f"Annual goal: {e['goals']['annual_1_metric']}",
-                    "status": "ACTIVE",
+                    "userId": uid, "type": "user",
+                    "name": e["goals"]["annual_1_name"],
+                    "metric": e["goals"]["annual_1_metric"],
+                    "description": e["goals"]["annual_1_name"],
+                    "category": "Goals", "state": "On Track", "done": 0,
+                    "start": GOAL_START, "due": GOAL_DUE,
                 }, username, password, sf)
                 if ok_goal1:
                     goals_ok += 1
@@ -644,11 +645,13 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             # Post dev goal (DevGoal_2001)
             try:
                 ok_goal2, _ = _sf_post_as_user("DevGoal_2001", {
-                    "externalCode": f"DEV_{uid}_2025_01",
-                    "userId": uid, "name": e["goals"]["dev_name"],
-                    "startDate": GOAL_START, "dueDate": GOAL_DUE,
-                    "description": f"Development goal: {e['goals']['dev_metric']}",
-                    "status": "ACTIVE",
+                    "userId": uid, "type": "development",
+                    "name": e["goals"]["dev_name"],
+                    "metric": e["goals"]["dev_metric"],
+                    "purpose": "Current role",
+                    "category": "Goals", "state": "On Track",
+                    "start": GOAL_START, "due": GOAL_DUE,
+                    "competencies": {"results": []},
                 }, username, password, sf)
                 if ok_goal2:
                     goals_ok += 1

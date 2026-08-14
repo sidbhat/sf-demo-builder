@@ -742,14 +742,14 @@ SCENARIO_KB = {
 }
 
 LOCALE_CONFIG = {
-    "USA": {"currency": "USD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "US/Eastern", "country_code": "USA"},
-    "GBR": {"currency": "GBP", "pay_scale": "GBR/GB1", "pay_group": "GB01", "locale": "en_GB", "tz": "Europe/London", "country_code": "GBR"},
-    "DEU": {"currency": "EUR", "pay_scale": "DEU/DE1", "pay_group": "DE01", "locale": "de_DE", "tz": "Europe/Berlin", "country_code": "DEU"},
-    "FRA": {"currency": "EUR", "pay_scale": "FRA/FR1", "pay_group": "FR01", "locale": "fr_FR", "tz": "Europe/Paris", "country_code": "FRA"},
-    "IND": {"currency": "INR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Kolkata", "country_code": "IND"},
-    "AUS": {"currency": "AUD", "pay_scale": "AUS/AU1", "pay_group": "AU01", "locale": "en_AU", "tz": "Australia/Sydney", "country_code": "AUS"},
-    "SGP": {"currency": "SGD", "pay_scale": "SGP/SG1", "pay_group": "SG01", "locale": "en_US", "tz": "Asia/Singapore", "country_code": "SGP"},
-    "BRA": {"currency": "BRL", "pay_scale": "BRA/BR1", "pay_group": "BR01", "locale": "pt_BR", "tz": "America/Sao_Paulo", "country_code": "BRA"},
+    "USA": {"currency": "USD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "US/Eastern",        "country_code": "USA"},
+    "GBR": {"currency": "GBP", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/London",     "country_code": "GBR"},
+    "DEU": {"currency": "EUR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/Berlin",     "country_code": "DEU"},
+    "FRA": {"currency": "EUR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/Paris",      "country_code": "FRA"},
+    "IND": {"currency": "INR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Kolkata",      "country_code": "IND"},
+    "AUS": {"currency": "AUD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Australia/Sydney",  "country_code": "AUS"},
+    "SGP": {"currency": "SGD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Singapore",    "country_code": "SGP"},
+    "BRA": {"currency": "BRL", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "America/Sao_Paulo", "country_code": "BRA"},
 }
 
 INDUSTRY_ROLES = {
@@ -928,14 +928,14 @@ _DEFAULT_GOAL = (
 )
 
 LOCALE_CONFIG = {
-    "USA": {"currency": "USD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "US/Eastern", "country_code": "USA"},
-    "GBR": {"currency": "GBP", "pay_scale": "GBR/GB1", "pay_group": "GB01", "locale": "en_GB", "tz": "Europe/London", "country_code": "GBR"},
-    "DEU": {"currency": "EUR", "pay_scale": "DEU/DE1", "pay_group": "DE01", "locale": "de_DE", "tz": "Europe/Berlin", "country_code": "DEU"},
-    "FRA": {"currency": "EUR", "pay_scale": "FRA/FR1", "pay_group": "FR01", "locale": "fr_FR", "tz": "Europe/Paris", "country_code": "FRA"},
-    "IND": {"currency": "INR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Kolkata", "country_code": "IND"},
-    "AUS": {"currency": "AUD", "pay_scale": "AUS/AU1", "pay_group": "AU01", "locale": "en_AU", "tz": "Australia/Sydney", "country_code": "AUS"},
-    "SGP": {"currency": "SGD", "pay_scale": "SGP/SG1", "pay_group": "SG01", "locale": "en_US", "tz": "Asia/Singapore", "country_code": "SGP"},
-    "BRA": {"currency": "BRL", "pay_scale": "BRA/BR1", "pay_group": "BR01", "locale": "pt_BR", "tz": "America/Sao_Paulo", "country_code": "BRA"},
+    "USA": {"currency": "USD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "US/Eastern",        "country_code": "USA"},
+    "GBR": {"currency": "GBP", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/London",     "country_code": "GBR"},
+    "DEU": {"currency": "EUR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/Berlin",     "country_code": "DEU"},
+    "FRA": {"currency": "EUR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Europe/Paris",      "country_code": "FRA"},
+    "IND": {"currency": "INR", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Kolkata",      "country_code": "IND"},
+    "AUS": {"currency": "AUD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Australia/Sydney",  "country_code": "AUS"},
+    "SGP": {"currency": "SGD", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "Asia/Singapore",    "country_code": "SGP"},
+    "BRA": {"currency": "BRL", "pay_scale": "USA/US1", "pay_group": "US", "locale": "en_US", "tz": "America/Sao_Paulo", "country_code": "BRA"},
 }
 
 INDUSTRY_ROLES = {
