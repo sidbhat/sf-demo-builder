@@ -288,13 +288,46 @@ if __name__ == "__main__":
                             "headers": [[b"content-length", str(len(body)).encode()]]})
                 await send({"type": "http.response.body", "body": body})
 
+        # Helper: wrap an ASGI lifespan as an async context manager
+        import contextlib
+        import anyio
+
+        @contextlib.asynccontextmanager
+        async def _start_mcp(asgi_app):
+            """Drive an MCP ASGI app's lifespan startup/shutdown in a background task."""
+            startup_complete = anyio.Event()
+            shutdown_event   = anyio.Event()
+
+            async def _lifespan():
+                msg_queue = []
+                async def _recv():
+                    if not msg_queue:
+                        await startup_complete.wait()
+                        await shutdown_event.wait()
+                        return {"type": "lifespan.shutdown"}
+                    return msg_queue.pop(0)
+                msg_queue.append({"type": "lifespan.startup"})
+                async def _send(msg):
+                    if msg["type"] == "lifespan.startup.complete":
+                        startup_complete.set()
+                await asgi_app({"type": "lifespan", "asgi": {"version": "3.0"}}, _recv, _send)
+
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(_lifespan)
+                await startup_complete.wait()
+                try:
+                    yield
+                finally:
+                    shutdown_event.set()
+
         class _AppWithLifespan:
-            def __init__(self):
-                self.lifespan = mcp_asgi.lifespan
             async def __call__(self, scope, receive, send):
                 if scope["type"] == "lifespan":
-                    await mcp_asgi(scope, receive, send)
-                    await mcp_a2a_asgi(scope, receive, send)
+                    async with _start_mcp(mcp_asgi), _start_mcp(mcp_a2a_asgi):
+                        await send({"type": "lifespan.startup.complete"})
+                        msg = await receive()
+                        assert msg["type"] == "lifespan.shutdown"
+                        await send({"type": "lifespan.shutdown.complete"})
                 else:
                     await dispatch(scope, receive, send)
 
