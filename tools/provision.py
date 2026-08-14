@@ -510,12 +510,6 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     # Use uid6 to derive unique award code prefix — avoids collisions across orgs
     BASE_CODE = 800000 + (int(uid6, 16) % 99000)
 
-    # Award date: 30 days ago (recent-past recognition)
-    import datetime as _dt_award
-    _award_dt = _today - _dt_award.timedelta(days=30)
-    import calendar as _cal_award
-    AWARD_DATE = f"/Date({int(_cal_award.timegm(_award_dt.timetuple())) * 1000})/"
-
     # Discover the active SpotAwardProgram at runtime — use first active one found
     _active_program = None
     try:
@@ -548,7 +542,6 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "nominatorId":  ceo_id,
             "awardAmount":  amt,
             "currency":     "USD",
-            "awardDate":    AWARD_DATE,
             "awardReason":  comment,
             "category":     "Recognition",
             "status":       "Approved",
