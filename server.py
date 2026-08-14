@@ -294,31 +294,9 @@ if __name__ == "__main__":
 
         @contextlib.asynccontextmanager
         async def _start_mcp(asgi_app):
-            """Drive an MCP ASGI app's lifespan startup/shutdown in a background task."""
-            startup_complete = anyio.Event()
-            shutdown_event   = anyio.Event()
-
-            async def _lifespan():
-                msg_queue = []
-                async def _recv():
-                    if not msg_queue:
-                        await startup_complete.wait()
-                        await shutdown_event.wait()
-                        return {"type": "lifespan.shutdown"}
-                    return msg_queue.pop(0)
-                msg_queue.append({"type": "lifespan.startup"})
-                async def _send(msg):
-                    if msg["type"] == "lifespan.startup.complete":
-                        startup_complete.set()
-                await asgi_app({"type": "lifespan", "asgi": {"version": "3.0"}}, _recv, _send)
-
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(_lifespan)
-                await startup_complete.wait()
-                try:
-                    yield
-                finally:
-                    shutdown_event.set()
+            """Start an MCP ASGI app's lifespan (Starlette lifespan_context)."""
+            async with asgi_app.lifespan(asgi_app):
+                yield
 
         class _AppWithLifespan:
             async def __call__(self, scope, receive, send):
