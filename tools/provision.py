@@ -542,9 +542,9 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
             "nominatorId":  ceo_id,
             "awardAmount":  amt,
             "currency":     "USD",
-            "awardReason":  comment,
+            "commentForReceiver": comment,
             "category":     "Recognition",
-            "status":       "Approved",
+            "approvalStatus": "Approved",
         }
         if _active_program:
             row["spotAwardProgram"] = _active_program
