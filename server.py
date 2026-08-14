@@ -290,26 +290,31 @@ if __name__ == "__main__":
 
         # Helper: wrap an ASGI lifespan as an async context manager
         import contextlib
-        import anyio
+        from starlette.applications import Starlette as _Starlette
+        from starlette.routing import Route as _Route2, Mount as _Mount
 
         @contextlib.asynccontextmanager
-        async def _start_mcp(asgi_app):
-            """Start an MCP ASGI app's lifespan (Starlette lifespan_context)."""
-            async with asgi_app.lifespan(asgi_app):
+        async def combined_lifespan(app):
+            async with mcp_asgi.lifespan(mcp_asgi), mcp_a2a_asgi.lifespan(mcp_a2a_asgi):
                 yield
 
-        class _AppWithLifespan:
-            async def __call__(self, scope, receive, send):
-                if scope["type"] == "lifespan":
-                    async with _start_mcp(mcp_asgi), _start_mcp(mcp_a2a_asgi):
-                        await send({"type": "lifespan.startup.complete"})
-                        msg = await receive()
-                        assert msg["type"] == "lifespan.shutdown"
-                        await send({"type": "lifespan.shutdown.complete"})
-                else:
-                    await dispatch(scope, receive, send)
+        app = _Starlette(lifespan=combined_lifespan, routes=[
+            _Route2("/health", health),
+            _Route2("/info",   info),
+        ])
 
-        app = _AppWithLifespan()
-        uvicorn.run(app, host="0.0.0.0", port=port_arg)
+        # Attach the dispatch function as a fallback ASGI app
+        _inner_dispatch = dispatch
+        original_app = app
+
+        async def _full_app(scope, receive, send):
+            if scope["type"] == "lifespan":
+                await original_app(scope, receive, send)
+            elif scope.get("path", "").startswith(("/health", "/info")):
+                await original_app(scope, receive, send)
+            else:
+                await _inner_dispatch(scope, receive, send)
+
+        uvicorn.run(_full_app, host="0.0.0.0", port=port_arg)
     else:
         mcp.run()
