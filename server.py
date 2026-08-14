@@ -106,17 +106,24 @@ mcp = FastMCP(
     auth=_build_auth(),
 )
 
+# A2A instance has no auth — ApiKeyMiddleware enforces identity before it reaches here
+mcp_a2a = FastMCP(
+    name="sf-demo-builder",
+    auth=None,
+)
+
 # ── Import and register all tool modules ──────────────────────────────────────
 
 from tools import design, provision, query, config, content, api_keys
 
-# Register all tools with mcp
-api_keys.register(mcp)
-design.register(mcp)
-provision.register(mcp)
-query.register(mcp)
-config.register(mcp)
-content.register(mcp)
+# Register all tools on both instances
+for _m in (mcp, mcp_a2a):
+    api_keys.register(_m)
+    design.register(_m)
+    provision.register(_m)
+    query.register(_m)
+    config.register(_m)
+    content.register(_m)
 
 # ── HTTP server setup (only if running with --http) ──────────────────────────
 
@@ -234,11 +241,13 @@ if __name__ == "__main__":
             return Response(html, media_type="text/html")
 
         if hasattr(mcp, "streamable_http_app"):
-            mcp_asgi = mcp.streamable_http_app(path="/", stateless_http=True)
+            mcp_asgi     = mcp.streamable_http_app(path="/", stateless_http=True)
+            mcp_a2a_asgi = mcp_a2a.streamable_http_app(path="/", stateless_http=True)
         else:
-            mcp_asgi = mcp.http_app(path="/", stateless_http=True)
+            mcp_asgi     = mcp.http_app(path="/", stateless_http=True)
+            mcp_a2a_asgi = mcp_a2a.http_app(path="/", stateless_http=True)
 
-        a2a_asgi = ApiKeyMiddleware(mcp_asgi)
+        a2a_asgi = ApiKeyMiddleware(mcp_a2a_asgi)
 
         def _make_prefix_stripper(prefix: str, inner: ASGIApp):
             async def _app(scope, receive, send):
@@ -285,6 +294,7 @@ if __name__ == "__main__":
             async def __call__(self, scope, receive, send):
                 if scope["type"] == "lifespan":
                     await mcp_asgi(scope, receive, send)
+                    await mcp_a2a_asgi(scope, receive, send)
                 else:
                     await dispatch(scope, receive, send)
 
