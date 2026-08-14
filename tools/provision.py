@@ -540,9 +540,9 @@ def _provision_sync(plan_json: str, caller_email: Optional[str]) -> str:
     for i, sub in enumerate(employees[1:]):
         comment = sub.get("spot_award") or _default_award_msgs[min(i, 3)]
         amt = [2500.0, 1500.0, 1500.0, 1000.0][min(i, 3)]
-        code = f"AWD-{BASE_CODE + i + 1}"
+        code = BASE_CODE + i + 1
         row = {
-            "__metadata": {"uri": f"SpotAward('{code}')"},
+            "__metadata": {"uri": f"SpotAward({code})"},
             "externalCode": code,
             "userId":       sub["userId"],
             "nominatorId":  ceo_id,
